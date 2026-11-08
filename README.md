@@ -16,12 +16,12 @@ The Mac app isn't notarised, so the first launch is blocked: open it once, then 
 
 ## Shortcuts
 
-| Key                     | Action                              |
-| ----------------------- | ----------------------------------- |
-| Ctrl/⌘ + O              | Add images                          |
-| Ctrl/⌘ + E              | Export PDF                          |
-| Ctrl/⌘ + P              | Print                               |
-| Ctrl/⌘ + 0              | Fit page                            |
-| Ctrl/⌘ + + / Ctrl/⌘ + − | Zoom                                |
-| ← / →                   | Previous / next page                |
-| ↑ / ↓                   | Step the focused number (⇧ for ×10) |
+| Key          | Action                              |
+| ------------ | ----------------------------------- |
+| Ctrl/⌘ & O   | Add images                          |
+| Ctrl/⌘ & E   | Export PDF                          |
+| Ctrl/⌘ & P   | Print                               |
+| Ctrl/⌘ & 0   | Fit page                            |
+| Ctrl/⌘ & +/− | Zoom                                |
+| ← / →        | Previous / next page                |
+| ↑ / ↓        | Step the focused number (⇧ for ×10) |
