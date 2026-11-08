@@ -1,6 +1,9 @@
-//! Renders packaging/icon.svg into a macOS .iconset folder (and a 256 px PNG for the window icon).
+//! Renders packaging/icon.svg into a macOS .iconset folder, plus packaging/icon-256.png (window icon)
+//! and packaging/icon.ico (Windows .exe icon, embedded by build.rs).
 //! Usage: cargo run --release --example render_icon -- packaging/icon.svg target/AppIcon.iconset
 
+use image::ExtendedColorType;
+use image::codecs::ico::{IcoEncoder, IcoFrame};
 use resvg::tiny_skia::{Pixmap, Transform};
 use resvg::usvg::{Options, Tree};
 
@@ -22,5 +25,10 @@ fn main() {
         std::fs::write(out.join(name), render(size * scale)).unwrap();
     }
     std::fs::write("packaging/icon-256.png", render(256)).unwrap();
+    let frames: Vec<IcoFrame> = [16, 24, 32, 48, 64, 128, 256]
+        .into_iter()
+        .map(|px| IcoFrame::with_encoded(render(px), px, px, ExtendedColorType::Rgba8).unwrap())
+        .collect();
+    IcoEncoder::new(std::fs::File::create("packaging/icon.ico").unwrap()).encode_images(&frames).unwrap();
     println!("wrote {}", out.display());
 }

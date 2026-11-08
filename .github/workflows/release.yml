@@ -1,0 +1,81 @@
+# Push a tag like v0.2.0 to build macOS, Windows and Linux and publish a GitHub release.
+# Running it by hand (Actions → Release → Run workflow) only builds, leaving the files as run artifacts.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Check the tag matches Cargo.toml
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)
+          [ "$GITHUB_REF_NAME" = "v$version" ] || { echo "::error::Tag $GITHUB_REF_NAME doesn't match Cargo.toml version $version"; exit 1; }
+
+      - name: Install Rust
+        run: rustup toolchain install stable --profile minimal && rustup default stable
+
+      - name: Build macOS (universal .app)
+        if: runner.os == 'macOS'
+        run: |
+          rustup target add aarch64-apple-darwin x86_64-apple-darwin
+          cargo build --release --locked --target aarch64-apple-darwin
+          cargo build --release --locked --target x86_64-apple-darwin
+          lipo -create -output target/button_badger target/aarch64-apple-darwin/release/button_badger target/x86_64-apple-darwin/release/button_badger
+          packaging/bundle.sh target/button_badger
+          mkdir dist
+          ditto -c -k --keepParent "target/release/Button Badger.app" "dist/Button-Badger-$GITHUB_REF_NAME-macos.zip"
+
+      - name: Build Windows
+        if: runner.os == 'Windows'
+        run: |
+          # build.rs embeds packaging/icon.ico and the file details using the runner's Windows SDK.
+          cargo build --release --locked
+          mkdir -p dist/pkg
+          cp target/release/button_badger.exe "dist/pkg/Button Badger.exe"
+          (cd dist/pkg && 7z a "../Button-Badger-$GITHUB_REF_NAME-windows-x64.zip" "Button Badger.exe")
+          rm -r dist/pkg
+
+      - name: Build Linux
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update && sudo apt-get install -y pkg-config libwayland-dev libxkbcommon-dev
+          cargo build --release --locked
+          mkdir dist
+          tar -czf "dist/Button-Badger-$GITHUB_REF_NAME-linux-x64.tar.gz" -C target/release button_badger
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ runner.os }}
+          path: dist/*
+
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" dist/* --repo "$GITHUB_REPOSITORY" --title "Button Badger $GITHUB_REF_NAME" --generate-notes

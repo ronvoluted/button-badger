@@ -8,6 +8,12 @@ Aligns images for printing button/badge templates to cut out in various configur
 
 ![Button Badger screenshot](docs/screenshot.png)
 
+## Download
+
+Grab the Mac, Windows or Linux build from [Releases](https://github.com/ronvoluted/button-badger/releases).
+
+The Mac app isn't notarised, so the first launch is blocked: open it once, then allow it under System Settings → Privacy & Security → Open Anyway.
+
 ## Shortcuts
 
 | Key                     | Action                              |
