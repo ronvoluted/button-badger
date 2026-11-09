@@ -358,25 +358,115 @@ fn hex_cells(area: Rect, cut: f32, pitch: f32) -> Vec<(f32, f32)> {
     out
 }
 
-/// Distribute images over pages. `qty[i]` copies of image `i`; `0` means "fill remaining cells".
-/// Returns, per page, the image index for each cell (None = empty cell). Always at least one page.
-pub fn paginate(cells_per_page: usize, qty: &[u32]) -> Vec<Vec<Option<usize>>> {
-    if cells_per_page == 0 {
+/// Distribute images over pages. `qty[i]` copies of image `i`; `0` means "share the remaining cells".
+/// Returns, per page, the image index for each of `cells` (None = empty). Always at least one page.
+///
+/// Copies of an image stay together: they're laid along a snaking path, so every group is one connected
+/// block. Each page snakes by rows or by columns (rows only for hex), whichever leaves the groups closest to whole strips.
+pub fn paginate(cells: &[(f32, f32)], qty: &[u32]) -> Vec<Vec<Option<usize>>> {
+    let per_page = cells.len();
+    if per_page == 0 {
         return vec![Vec::new()];
     }
-    let mut seq: Vec<Option<usize>> = Vec::new();
+    let fixed: usize = qty.iter().map(|&q| q as usize).sum();
+    let pages = fixed.div_ceil(per_page).max(1);
+    let spare = pages * per_page - fixed;
+    let fillers: Vec<usize> = (0..qty.len()).filter(|&i| qty[i] == 0).collect();
+
+    // Explicit copies first, then the spare cells split as evenly as possible between "fill" images.
+    let mut seq: Vec<Option<usize>> = Vec::with_capacity(pages * per_page);
     for (i, &q) in qty.iter().enumerate() {
         seq.extend(std::iter::repeat_n(Some(i), q as usize));
     }
-    let fillers: Vec<usize> = qty.iter().enumerate().filter(|(_, q)| **q == 0).map(|(i, _)| i).collect();
-    let pages = seq.len().div_ceil(cells_per_page).max(1);
-    let total = pages * cells_per_page;
-    let mut k = 0;
-    while seq.len() < total {
-        seq.push(if fillers.is_empty() { None } else { Some(fillers[k % fillers.len()]) });
-        k += 1;
+    for (k, &i) in fillers.iter().enumerate() {
+        let n = spare / fillers.len() + usize::from(k < spare % fillers.len());
+        seq.extend(std::iter::repeat_n(Some(i), n));
     }
-    seq.chunks(cells_per_page).map(|c| c.to_vec()).collect()
+    seq.resize(pages * per_page, None);
+
+    let grid = Grid::new(cells);
+    // Hex "columns" zigzag rather than forming a strip, so only square grids try snaking by columns.
+    let square = cells.iter().zip(&grid.rc).all(|(cell, &(_, col))| cells.get(col).is_some_and(|top| (cell.0 - top.0).abs() < 1e-3));
+    let paths = if square { vec![grid.snake(false), grid.snake(true)] } else { vec![grid.snake(false)] };
+    seq.chunks(per_page)
+        .map(|chunk| {
+            let place = |path: &Vec<usize>| {
+                let mut page = vec![None; per_page];
+                for (&cell, &item) in path.iter().zip(chunk) {
+                    page[cell] = item;
+                }
+                page
+            };
+            // Ties go to rows (listed first).
+            paths.iter().map(place).min_by_key(|page| grid.score(page)).unwrap_or_default()
+        })
+        .collect()
+}
+
+/// Row/column indices and neighbours of a page's cells (which come in row order, grid or hex).
+struct Grid {
+    rc: Vec<(usize, usize)>,
+    neighbours: Vec<Vec<usize>>,
+}
+
+impl Grid {
+    fn new(cells: &[(f32, f32)]) -> Grid {
+        let mut rc = Vec::with_capacity(cells.len());
+        let (mut r, mut c) = (0, 0);
+        for (k, cell) in cells.iter().enumerate() {
+            if k > 0 && (cell.1 - cells[k - 1].1).abs() > 1e-3 {
+                (r, c) = (r + 1, 0);
+            }
+            rc.push((r, c));
+            c += 1;
+        }
+        // Touching cells are one pitch apart, the closest any two cells get.
+        let dist = |a: usize, b: usize| (cells[a].0 - cells[b].0).hypot(cells[a].1 - cells[b].1);
+        let n = cells.len();
+        let pitch = (0..n).flat_map(|a| (a + 1..n).map(move |b| (a, b))).map(|(a, b)| dist(a, b)).fold(f32::INFINITY, f32::min);
+        let neighbours = (0..n).map(|a| (0..n).filter(|&b| b != a && dist(a, b) < pitch * 1.05).collect()).collect();
+        Grid { rc, neighbours }
+    }
+
+    /// Cell order along rows (or columns), reversing direction each line.
+    fn snake(&self, by_columns: bool) -> Vec<usize> {
+        let mut order: Vec<usize> = (0..self.rc.len()).collect();
+        order.sort_by_key(|&k| {
+            let (line, pos) = if by_columns { (self.rc[k].1, self.rc[k].0) } else { self.rc[k] };
+            (line, if line % 2 == 1 { -(pos as isize) } else { pos as isize })
+        });
+        order
+    }
+
+    /// Lower is better: (broken-up groups, cells missing from each group's bounding rectangle, edges between groups).
+    fn score(&self, page: &[Option<usize>]) -> (usize, usize, usize) {
+        let mut groups: Vec<Option<usize>> = page.to_vec();
+        groups.sort();
+        groups.dedup();
+        let (mut broken, mut gaps) = (0, 0);
+        for g in groups {
+            let members: Vec<usize> = (0..page.len()).filter(|&k| page[k] == g).collect();
+            // Flood fill from the first member; anything not reached means the group is split.
+            let mut seen = vec![members[0]];
+            let mut i = 0;
+            while i < seen.len() {
+                for &b in &self.neighbours[seen[i]] {
+                    if page[b] == g && !seen.contains(&b) {
+                        seen.push(b);
+                    }
+                }
+                i += 1;
+            }
+            broken += usize::from(seen.len() < members.len());
+            let span = |f: fn(&(usize, usize)) -> usize| {
+                let v = members.iter().map(|&k| f(&self.rc[k]));
+                v.clone().max().unwrap_or(0) - v.min().unwrap_or(0) + 1
+            };
+            gaps += span(|p| p.0) * span(|p| p.1) - members.len();
+        }
+        let edges = (0..page.len()).map(|a| self.neighbours[a].iter().filter(|&&b| page[b] != page[a]).count()).sum::<usize>() / 2;
+        (broken, gaps, edges)
+    }
 }
 
 #[cfg(test)]
@@ -436,15 +526,63 @@ mod tests {
         }
     }
 
+    /// Cell centres of a `cols × rows` grid, 10 mm apart, in row order like `Sheet::cells`.
+    fn grid(cols: usize, rows: usize) -> Vec<(f32, f32)> {
+        (0..rows).flat_map(|r| (0..cols).map(move |c| (c as f32 * 10.0, r as f32 * 10.0))).collect()
+    }
+
     #[test]
     fn pagination() {
-        assert_eq!(paginate(4, &[]), vec![vec![None; 4]]);
-        assert_eq!(paginate(4, &[0]), vec![vec![Some(0); 4]]);
-        let p = paginate(4, &[6, 0]);
+        assert_eq!(paginate(&grid(2, 2), &[]), vec![vec![None; 4]]);
+        assert_eq!(paginate(&grid(2, 2), &[0]), vec![vec![Some(0); 4]]);
+        let p = paginate(&grid(2, 2), &[6, 0]);
         assert_eq!(p.len(), 2);
-        assert_eq!(p[1], vec![Some(0), Some(0), Some(1), Some(1)]);
-        let p = paginate(3, &[2, 2]);
-        assert_eq!(p, vec![vec![Some(0), Some(0), Some(1)], vec![Some(1), None, None]]);
+        assert_eq!(p[1].iter().filter(|c| **c == Some(1)).count(), 2);
+        let p = paginate(&grid(3, 1), &[2, 2]);
+        assert_eq!(p[1].iter().flatten().count(), 1);
+    }
+
+    #[test]
+    fn copies_form_strips() {
+        // Portrait 3 × 4 grid with a "fill the rest" image after the counted one.
+        let cells = grid(3, 4);
+        let spots = |qty: u32| -> Vec<(f32, f32)> {
+            let page = &paginate(&cells, &[qty, 0])[0];
+            (0..cells.len()).filter(|&k| page[k] == Some(0)).map(|k| cells[k]).collect()
+        };
+        let distinct = |v: Vec<f32>| v.iter().fold(Vec::<f32>::new(), |mut u, x| { if !u.contains(x) { u.push(*x) } u }).len();
+        let s = spots(4);
+        assert_eq!(distinct(s.iter().map(|c| c.0).collect()), 1, "4 copies: one column, got {s:?}");
+        let s = spots(3);
+        assert_eq!(distinct(s.iter().map(|c| c.1).collect()), 1, "3 copies: one row, got {s:?}");
+        let s = spots(6);
+        assert_eq!(distinct(s.iter().map(|c| c.1).collect()), 2, "6 copies: two rows, got {s:?}");
+    }
+
+    #[test]
+    fn hex_uses_rows() {
+        // Hex rows: 3 copies stay in the first row rather than zigzagging down a "column".
+        let sheet = Sheet { packing: Packing::Hex, paper: Paper::A5, orientation: Orientation::Landscape, gap_mm: 7.0, margin_mm: 8.0, ..Sheet::default() };
+        let cells = sheet.cells();
+        let page = &paginate(&cells, &[3, 0, 0])[0];
+        let ys: Vec<f32> = (0..cells.len()).filter(|&k| page[k] == Some(0)).map(|k| cells[k].1).collect();
+        assert!(ys.iter().all(|&y| y == ys[0]), "{page:?}");
+    }
+
+    #[test]
+    fn groups_stay_connected() {
+        for packing in [Packing::Grid, Packing::Hex] {
+            for paper in [Paper::A4, Paper::A5] {
+                let sheet = Sheet { packing, paper, ..Sheet::default() };
+                let cells = sheet.cells();
+                let grid = Grid::new(&cells);
+                for qty in [vec![3, 0, 0], vec![5, 2, 0], vec![1, 7, 4], vec![0, 0, 0, 0]] {
+                    for page in paginate(&cells, &qty) {
+                        assert_eq!(grid.score(&page).0, 0, "{packing:?} {paper:?} {qty:?}: {page:?}");
+                    }
+                }
+            }
+        }
     }
 
     #[test]

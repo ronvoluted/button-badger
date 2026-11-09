@@ -330,7 +330,7 @@ impl App {
     fn relayout(&mut self) {
         self.cells = self.sheet().cells();
         let qty: Vec<u32> = self.images.iter().map(|i| i.qty).collect();
-        self.pages = layout::paginate(self.cells.len(), &qty);
+        self.pages = layout::paginate(&self.cells, &qty);
         self.page = self.page.min(self.pages.len() - 1);
         self.invalidate();
     }

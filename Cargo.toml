@@ -1,6 +1,6 @@
 [package]
 name = "button_badger"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 rust-version = "1.99"
 description = "Auto-align images for printing as button/badge template cutouts"

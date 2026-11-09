@@ -302,7 +302,7 @@ mod tests {
     fn writes_valid_pdf_with_shared_image() {
         let sheet = Sheet { background: Some([0.95, 0.9, 0.8]), ..Sheet::default() };
         let images = [sample()];
-        let pages = crate::layout::paginate(sheet.cells().len(), &[0]);
+        let pages = crate::layout::paginate(&sheet.cells(), &[0]);
         let doc = Document { sheet: &sheet, images: &images, pages: Pages::Badges(&pages), calibration: (1.01, 0.99), title: "t" };
         let bytes = doc.pdf();
         assert!(bytes.starts_with(b"%PDF-"));
