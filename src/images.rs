@@ -57,11 +57,14 @@ pub fn load(path: &Path) -> Result<Loaded, String> {
     }
     let has_alpha = has_alpha && full.pixels().any(|p| p[3] < 255);
     let name = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "image".into());
+    let full = Arc::new(full);
+    // Small images share one buffer rather than keeping an identical preview copy.
+    let preview = if full.width().max(full.height()) <= MAX_PREVIEW { Arc::clone(&full) } else { Arc::new(shrink(&full, MAX_PREVIEW)) };
     Ok(Loaded {
         path: path.to_path_buf(),
         name,
-        preview: Arc::new(shrink(&full, MAX_PREVIEW)),
-        full: Arc::new(full),
+        preview,
+        full,
         has_alpha,
         qty: 0,
         zoom: 1.0,

@@ -71,9 +71,14 @@ pub fn print(doc: &Document) -> Result<String, String> {
             return Err("The printer refused the job".into());
         }
         for n in 0..doc.page_count() {
-            let img = crate::raster::render_page(doc, n, dpi);
+            let mut img = crate::raster::render_page(doc, n, dpi);
             let (w, h) = img.dimensions();
-            let bgra: Vec<u8> = img.pixels().flat_map(|p| [p[2], p[1], p[0], 255]).collect();
+            // RGBA → BGRA in place: a full page at printer DPI is ~140 MB, so don't hold a second copy.
+            // Alpha is already 255 (render_page returns an opaque page).
+            for p in img.pixels_mut() {
+                p.0.swap(0, 2);
+            }
+            let bgra = img.as_raw();
             let bmi = BITMAPINFO {
                 bmiHeader: BITMAPINFOHEADER {
                     biSize: size_of::<BITMAPINFOHEADER>() as u32,

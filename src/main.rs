@@ -398,8 +398,9 @@ impl App {
             }
             Field::Scale(i) => {
                 let cleaned: String = s.chars().filter(|c| c.is_ascii_digit() || *c == '.').take(6).collect();
-                self.texts.insert(field, cleaned.clone());
-                if let (Ok(v), Some(img)) = (cleaned.parse::<f32>(), self.images.get_mut(i))
+                let parsed = cleaned.parse::<f32>();
+                self.texts.insert(field, cleaned);
+                if let (Ok(v), Some(img)) = (parsed, self.images.get_mut(i))
                     && v.is_finite()
                     && v >= 1.0
                 {
@@ -427,8 +428,9 @@ impl App {
             }
             _ => {
                 let cleaned: String = s.chars().filter(|c| c.is_ascii_digit() || *c == '.' || *c == ',').take(8).collect();
-                self.texts.insert(field, cleaned.clone());
-                if let Some(v) = parse_decimal(&cleaned) {
+                let parsed = parse_decimal(&cleaned);
+                self.texts.insert(field, cleaned);
+                if let Some(v) = parsed {
                     let v = if field == Field::Weight { v } else { self.units().to_mm(v) };
                     self.set_dimension(field, v);
                     self.sheet_changed();
