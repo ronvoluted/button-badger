@@ -63,6 +63,22 @@ enum Bg {
     Custom,
 }
 
+/// One change to the sheet's settings. `App::edit_sheet` applies it, then refreshes everything derived from the sheet.
+#[derive(Debug, Clone)]
+enum SheetEdit {
+    BadgePreset(String),
+    Paper(Paper),
+    Orientation(Orientation),
+    Packing(Packing),
+    Units(Units),
+    CutStyle(LineStyle),
+    Fit(Fit),
+    Toggle(Toggle, bool),
+    Background(Bg),
+    BgHex(String),
+    BgSwatch([f32; 3]),
+}
+
 #[derive(Debug, Clone)]
 enum Message {
     // Images
@@ -84,17 +100,7 @@ enum Message {
     ArrowStep(f32),
     StepFocused(iced::widget::Id, f32),
     // Sheet settings
-    BadgePreset(String),
-    Paper(Paper),
-    Orientation(Orientation),
-    Packing(Packing),
-    Units(Units),
-    CutStyle(LineStyle),
-    Fit(Fit),
-    Toggle(Toggle, bool),
-    Background(Bg),
-    BgHex(String),
-    BgSwatch([f32; 3]),
+    Sheet(SheetEdit),
     // Preview
     Preview(Interaction),
     ZoomBy(f32),

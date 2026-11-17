@@ -6,7 +6,7 @@ use crate::layout::{PRESETS, Sheet, TestPage, trim_float};
 use crate::pdf::{Document, Pages};
 use crate::preview::Interaction;
 use crate::settings::{self, Preset};
-use crate::{App, Bg, DEFAULT_CUSTOM_BG, Message, Toast, Toggle, hex_of, parse_hex, print};
+use crate::{App, Bg, DEFAULT_CUSTOM_BG, Message, SheetEdit, Toast, Toggle, hex_of, parse_hex, print};
 use iced::advanced::widget::{operate, operation::focusable::find_focused};
 use iced::{Task, Vector};
 use std::path::PathBuf;
@@ -87,76 +87,7 @@ impl App {
             }
 
             // Sheet settings
-            Message::BadgePreset(name) => {
-                if let Some(p) = PRESETS.iter().find(|p| p.name == name) {
-                    self.settings.sheet.face_mm = p.face_mm;
-                    self.settings.sheet.bleed_mm = p.bleed_mm;
-                    self.sync_texts();
-                    self.sheet_changed();
-                }
-            }
-            Message::Paper(p) => {
-                self.settings.sheet.paper = p;
-                self.settings.calibration_paper = p;
-                self.zoom = None;
-                self.sheet_changed();
-            }
-            Message::Orientation(o) => {
-                self.settings.sheet.orientation = o;
-                self.zoom = None;
-                self.sheet_changed();
-            }
-            Message::Packing(p) => {
-                self.settings.sheet.packing = p;
-                self.sheet_changed();
-            }
-            Message::Units(u) => {
-                self.settings.sheet.units = u;
-                self.sync_texts();
-                self.sheet_changed();
-            }
-            Message::CutStyle(s) => {
-                self.settings.sheet.guides.cut = s;
-                self.sheet_changed();
-            }
-            Message::Fit(f) => {
-                self.settings.sheet.fit = f;
-                self.sheet_changed();
-            }
-            Message::Toggle(t, v) => {
-                let g = &mut self.settings.sheet.guides;
-                match t {
-                    Toggle::FaceLine => g.face = v,
-                    Toggle::CropMarks => g.crop_marks = v,
-                    Toggle::Clip => g.clip = v,
-                }
-                self.sheet_changed();
-            }
-            Message::Background(bg) => {
-                self.bg_mode = bg;
-                self.settings.sheet.background = match bg {
-                    Bg::None => None,
-                    Bg::White => Some([1.0; 3]),
-                    Bg::Custom => parse_hex(&self.bg_hex).or(parse_hex(DEFAULT_CUSTOM_BG)),
-                };
-                self.sheet_changed();
-            }
-            Message::BgSwatch(rgb) => {
-                self.bg_hex = hex_of(rgb);
-                self.bg_mode = Bg::Custom;
-                self.settings.sheet.background = Some(rgb);
-                self.sheet_changed();
-            }
-            Message::BgHex(s) => {
-                let digits: String = s.chars().filter(char::is_ascii_hexdigit).take(6).collect();
-                self.bg_hex = format!("#{digits}");
-                if let Some(rgb) = parse_hex(&self.bg_hex)
-                    && self.bg_mode == Bg::Custom
-                {
-                    self.settings.sheet.background = Some(rgb);
-                    self.sheet_changed();
-                }
-            }
+            Message::Sheet(edit) => self.edit_sheet(edit),
 
             // Preview
             Message::Preview(interaction) => self.interact(interaction),
@@ -335,6 +266,62 @@ impl App {
             }
         }
         Task::none()
+    }
+
+    /// Apply one sheet setting, then refresh what's derived from the sheet. An arm that changes nothing returns early.
+    fn edit_sheet(&mut self, edit: SheetEdit) {
+        let sheet = &mut self.settings.sheet;
+        match edit {
+            SheetEdit::BadgePreset(name) => {
+                let Some(p) = PRESETS.iter().find(|p| p.name == name) else { return };
+                sheet.face_mm = p.face_mm;
+                sheet.bleed_mm = p.bleed_mm;
+                self.sync_texts();
+            }
+            SheetEdit::Paper(p) => {
+                sheet.paper = p;
+                self.settings.calibration_paper = p;
+                self.zoom = None;
+            }
+            SheetEdit::Orientation(o) => {
+                sheet.orientation = o;
+                self.zoom = None;
+            }
+            SheetEdit::Packing(p) => sheet.packing = p,
+            SheetEdit::Units(u) => {
+                sheet.units = u;
+                self.sync_texts();
+            }
+            SheetEdit::CutStyle(s) => sheet.guides.cut = s,
+            SheetEdit::Fit(f) => sheet.fit = f,
+            SheetEdit::Toggle(t, v) => match t {
+                Toggle::FaceLine => sheet.guides.face = v,
+                Toggle::CropMarks => sheet.guides.crop_marks = v,
+                Toggle::Clip => sheet.guides.clip = v,
+            },
+            SheetEdit::Background(bg) => {
+                self.bg_mode = bg;
+                sheet.background = match bg {
+                    Bg::None => None,
+                    Bg::White => Some([1.0; 3]),
+                    Bg::Custom => parse_hex(&self.bg_hex).or(parse_hex(DEFAULT_CUSTOM_BG)),
+                };
+            }
+            SheetEdit::BgSwatch(rgb) => {
+                self.bg_hex = hex_of(rgb);
+                self.bg_mode = Bg::Custom;
+                sheet.background = Some(rgb);
+            }
+            SheetEdit::BgHex(s) => {
+                let digits: String = s.chars().filter(char::is_ascii_hexdigit).take(6).collect();
+                self.bg_hex = format!("#{digits}");
+                match parse_hex(&self.bg_hex) {
+                    Some(rgb) if self.bg_mode == Bg::Custom => sheet.background = Some(rgb),
+                    _ => return,
+                }
+            }
+        }
+        self.sheet_changed();
     }
 
     /// The mouse did something on the preview canvas.

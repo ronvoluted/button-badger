@@ -3,7 +3,7 @@
 use crate::layout::{Fit, LineStyle, Orientation, PRESETS, Packing, Paper, TestPage, Units, trim_float};
 use crate::preview::{Guides, Preview, Viewport};
 use crate::theme::{self, Colors, SIDEBAR_WIDTH, SPACE_M, SPACE_S, SPACE_XS, icon};
-use crate::{App, Bg, CUSTOM_BADGE, Field, Message, Toast, Toggle};
+use crate::{App, Bg, CUSTOM_BADGE, Field, Message, SheetEdit, Toast, Toggle};
 
 use iced::widget::{Button, Column, Row, button, canvas, column, container, pick_list, row, rule, scrollable, slider, space, stack, text, text_input, toggler, tooltip};
 use iced::{Alignment, Color, Element, Font, Length::Fill, Padding, Theme, font};
@@ -115,17 +115,17 @@ impl App {
             .map_or(CUSTOM_BADGE, |p| p.name)
             .to_string();
 
-        let mut background = Column::new().spacing(SPACE_XS).push(segmented(&[(Bg::None, "Paper"), (Bg::White, "White"), (Bg::Custom, "Colour")], self.bg_mode, Message::Background));
+        let mut background = Column::new().spacing(SPACE_XS).push(segmented(&[(Bg::None, "Paper"), (Bg::White, "White"), (Bg::Custom, "Colour")], self.bg_mode, SheetEdit::Background));
         if self.bg_mode == Bg::Custom {
             let current = s.background.unwrap_or([1.0; 3]);
             let swatches = SWATCHES.iter().fold(Row::new().spacing(SPACE_XS).align_y(Alignment::Center), |r, &rgb| {
                 let selected = rgb.iter().zip(current).all(|(a, b)| (a - b).abs() < 0.002);
-                r.push(button(space().width(16).height(16)).padding(2).style(theme::swatch(rgb, selected)).on_press(Message::BgSwatch(rgb)))
+                r.push(button(space().width(16).height(16)).padding(2).style(theme::swatch(rgb, selected)).on_press(Message::Sheet(SheetEdit::BgSwatch(rgb))))
             });
             let hex = row![
                 text("Hex").size(12).style(muted),
                 space().width(Fill),
-                text_input("#RRGGBB", &self.bg_hex).on_input(Message::BgHex).width(90).padding([4, 6]).size(12).style(theme::field),
+                text_input("#RRGGBB", &self.bg_hex).on_input(|s| Message::Sheet(SheetEdit::BgHex(s))).width(90).padding([4, 6]).size(12).style(theme::field),
             ]
             .spacing(SPACE_XS)
             .align_y(Alignment::Center);
@@ -135,7 +135,7 @@ impl App {
         card(
             column![
                 section("Badge"),
-                pick_list(preset_names, Some(selected), Message::BadgePreset).width(Fill).padding([6, 10]).text_size(13).style(theme::picker),
+                pick_list(preset_names, Some(selected), |name| Message::Sheet(SheetEdit::BadgePreset(name))).width(Fill).padding([6, 10]).text_size(13).style(theme::picker),
                 row![
                     num_field("Face", self.text(Field::Face), u.suffix(), Field::Face),
                     num_field("Bleed", self.text(Field::Bleed), u.suffix(), Field::Bleed),
@@ -147,7 +147,7 @@ impl App {
                     container(text(format!("Ø {} {}", u.format(s.cut_mm()), u.suffix())).size(12)).style(theme::chip).padding([2, 8]),
                 ]
                 .align_y(Alignment::Center),
-                labelled("Image fit", segmented(&[(Fit::Fill, "Cover"), (Fit::Fit, "Contain")], s.fit, Message::Fit)),
+                labelled("Image fit", segmented(&[(Fit::Fill, "Cover"), (Fit::Fit, "Contain")], s.fit, SheetEdit::Fit)),
                 labelled("Background", background),
                 switch("Clip image", s.guides.clip, Toggle::Clip),
             ]
@@ -161,8 +161,8 @@ impl App {
         let mut col = column![
             section("Paper"),
             row![
-                pick_list(Paper::ALL.as_slice(), Some(s.paper), Message::Paper).width(Fill).padding([6, 10]).text_size(13).style(theme::picker),
-                segmented(&[(Units::Mm, "mm"), (Units::Inch, "in")], u, Message::Units),
+                pick_list(Paper::ALL.as_slice(), Some(s.paper), |p| Message::Sheet(SheetEdit::Paper(p))).width(Fill).padding([6, 10]).text_size(13).style(theme::picker),
+                segmented(&[(Units::Mm, "mm"), (Units::Inch, "in")], u, SheetEdit::Units),
             ]
             .spacing(SPACE_S)
             .align_y(Alignment::Center),
@@ -178,10 +178,10 @@ impl App {
             );
         }
         card(
-            col.push(segmented(&[(Orientation::Portrait, "Portrait"), (Orientation::Landscape, "Landscape")], s.orientation, Message::Orientation))
+            col.push(segmented(&[(Orientation::Portrait, "Portrait"), (Orientation::Landscape, "Landscape")], s.orientation, SheetEdit::Orientation))
                 .push(slider_field("Gap between badges", Field::Gap, s.gap_mm, 0.0..=20.0, self.text(Field::Gap), u))
                 .push(slider_field("Printer margin", Field::Margin, s.margin_mm, 0.0..=30.0, self.text(Field::Margin), u))
-                .push(labelled("Packing", segmented(&[(Packing::Auto, "Max"), (Packing::Grid, "Grid"), (Packing::Hex, "Hex")], s.packing, Message::Packing))),
+                .push(labelled("Packing", segmented(&[(Packing::Auto, "Max"), (Packing::Grid, "Grid"), (Packing::Hex, "Hex")], s.packing, SheetEdit::Packing))),
         )
     }
 
@@ -191,7 +191,7 @@ impl App {
         card(
             column![
                 section("Guides"),
-                labelled("Cut line", segmented(&cut_styles, g.cut, Message::CutStyle)),
+                labelled("Cut line", segmented(&cut_styles, g.cut, SheetEdit::CutStyle)),
                 row![
                     column![
                         tip(switch("Framing aid", g.face, Toggle::FaceLine), "Shows the face circle in the preview so you can frame the art. It is never printed."),
@@ -383,12 +383,12 @@ fn label_button<'a>(body: &'static str, icon_tone: fn(&Colors) -> Color, label: 
 }
 
 fn switch<'a>(label: &'a str, value: bool, which: Toggle) -> Element<'a, Message> {
-    toggler(value).label(label).on_toggle(move |v| Message::Toggle(which, v)).text_size(13).size(18).style(theme::switch).into()
+    toggler(value).label(label).on_toggle(move |v| Message::Sheet(SheetEdit::Toggle(which, v))).text_size(13).size(18).style(theme::switch).into()
 }
 
-fn segmented<'a, T: Copy + PartialEq + 'a>(options: &[(T, &'a str)], selected: T, msg: fn(T) -> Message) -> Element<'a, Message> {
+fn segmented<'a, T: Copy + PartialEq + 'a>(options: &[(T, &'a str)], selected: T, edit: fn(T) -> SheetEdit) -> Element<'a, Message> {
     let buttons = options.iter().fold(Row::new().spacing(2), |r, &(value, label)| {
-        r.push(button(text(label).size(12).align_x(Alignment::Center).width(Fill)).style(theme::segment(value == selected)).padding([4, 8]).width(Fill).on_press(msg(value)))
+        r.push(button(text(label).size(12).align_x(Alignment::Center).width(Fill)).style(theme::segment(value == selected)).padding([4, 8]).width(Fill).on_press(Message::Sheet(edit(value))))
     });
     container(buttons).style(theme::segment_track).padding(2).width(Fill).into()
 }
