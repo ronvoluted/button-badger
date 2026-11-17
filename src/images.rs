@@ -3,6 +3,7 @@
 use crate::layout::Sheet;
 use image::imageops::{self, FilterType};
 use image::{DynamicImage, ImageDecoder, ImageReader, Rgba, RgbaImage};
+use resvg::usvg::fontdb::Database;
 use std::borrow::Cow;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock};
@@ -104,14 +105,48 @@ fn friendly(e: image::ImageError) -> String {
 }
 
 /// System fonts for SVG text, scanned once on the first SVG load.
-static FONTS: LazyLock<Arc<resvg::usvg::fontdb::Database>> = LazyLock::new(|| {
-    let mut db = resvg::usvg::fontdb::Database::new();
+static FONTS: LazyLock<Arc<Database>> = LazyLock::new(|| {
+    let mut db = Database::new();
     db.load_system_fonts();
+    fill_generic_families(&mut db);
     Arc::new(db)
 });
 
+/// Point each generic family (`serif`, `sans-serif`, …) that doesn't resolve at an installed font.
+/// fontdb names them after Mac and Windows fonts such as Times New Roman, and usvg falls back to `serif`
+/// for any font it can't find, so on a Linux machine without those fonts all SVG text silently vanished.
+fn fill_generic_families(db: &mut Database) {
+    use resvg::usvg::fontdb::{Family, Query};
+    const SERIF: &[&str] = &["DejaVu Serif", "Liberation Serif", "Noto Serif", "FreeSerif"];
+    const SANS: &[&str] = &["DejaVu Sans", "Liberation Sans", "Noto Sans", "FreeSans", "Ubuntu", "Cantarell"];
+    const MONO: &[&str] = &["DejaVu Sans Mono", "Liberation Mono", "Noto Sans Mono", "FreeMono"];
+    type Generic = (Family<'static>, &'static [&'static [&'static str]], fn(&mut Database, String));
+    let generics: [Generic; 5] = [
+        (Family::Serif, &[SERIF, SANS], |db, f| db.set_serif_family(f)),
+        (Family::SansSerif, &[SANS, SERIF], |db, f| db.set_sans_serif_family(f)),
+        (Family::Monospace, &[MONO, SANS, SERIF], |db, f| db.set_monospace_family(f)),
+        (Family::Cursive, &[SANS, SERIF], |db, f| db.set_cursive_family(f)),
+        (Family::Fantasy, &[SANS, SERIF], |db, f| db.set_fantasy_family(f)),
+    ];
+    let resolves = |db: &Database, family| db.query(&Query { families: &[family], ..Default::default() }).is_some();
+    // Last resort: whatever font is installed, so text still shows, if not in the intended style.
+    let Some(any) = db.faces().find_map(|f| f.families.first()).map(|(name, _)| name.clone()) else {
+        return;
+    };
+    for (generic, candidates, set) in generics {
+        if !resolves(db, generic) {
+            let found = candidates.iter().flat_map(|c| c.iter()).find(|name| resolves(db, Family::Name(name)));
+            set(db, found.map_or_else(|| any.clone(), |name| name.to_string()));
+        }
+    }
+}
+
 fn parse_svg(bytes: &[u8]) -> Result<resvg::usvg::Tree, String> {
-    let options = resvg::usvg::Options { fontdb: Arc::clone(&FONTS), ..Default::default() };
+    parse_svg_with(bytes, Arc::clone(&FONTS))
+}
+
+fn parse_svg_with(bytes: &[u8], fontdb: Arc<Database>) -> Result<resvg::usvg::Tree, String> {
+    let options = resvg::usvg::Options { fontdb, ..Default::default() };
     resvg::usvg::Tree::from_data(bytes, &options).map_err(|e| e.to_string())
 }
 
@@ -239,6 +274,24 @@ mod tests {
         }
         let svg = br#"<svg xmlns="http://www.w3.org/2000/svg" width="200" height="60"><text x="10" y="40" font-size="32">Badger</text></svg>"#;
         let tree = parse_svg(svg).unwrap();
+        assert!(rasterise(&tree).unwrap().pixels().any(|p| p[3] > 0), "text left no pixels");
+    }
+
+    #[test]
+    fn svg_text_is_drawn_when_no_generic_family_is_installed() {
+        // Like a Linux machine without Times New Roman and co., which fontdb's generic families default to.
+        let mut db = (**FONTS).clone();
+        if db.is_empty() {
+            return;
+        }
+        db.set_serif_family("No Such Font");
+        db.set_sans_serif_family("No Such Font");
+        db.set_monospace_family("No Such Font");
+        db.set_cursive_family("No Such Font");
+        db.set_fantasy_family("No Such Font");
+        fill_generic_families(&mut db);
+        let svg = br#"<svg xmlns="http://www.w3.org/2000/svg" width="200" height="60"><text x="10" y="40" font-size="32" font-family="No Such Font">Badger</text></svg>"#;
+        let tree = parse_svg_with(svg, Arc::new(db)).unwrap();
         assert!(rasterise(&tree).unwrap().pixels().any(|p| p[3] > 0), "text left no pixels");
     }
 
