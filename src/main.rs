@@ -765,7 +765,7 @@ impl App {
                 presets.push(Preset { name: name.clone(), sheet: self.settings.sheet.clone() });
                 presets.sort_by(|a, b| a.name.cmp(&b.name));
                 self.settings.save();
-                self.toast = Toast::info(format!("Preset “{name}” saved"));
+                self.toast = Toast::info(format!("Setup “{name}” saved"));
                 self.selected_preset = Some(name);
                 self.preset_name.clear();
             }
