@@ -165,7 +165,9 @@ enum Message {
     DismissToast,
     Tick(Instant),
     ToggleDark,
-    /// Dev aid: `BUTTON_BADGER_SCREENSHOT=out.png` saves a window capture a few seconds after launch and exits.
+    /// Dev aid, debug builds only: `BUTTON_BADGER_SCREENSHOT=out.png` saves a window capture a few seconds
+    /// after launch and exits.
+    #[cfg(debug_assertions)]
     Screenshot(window::Screenshot),
 }
 
@@ -218,6 +220,7 @@ struct App {
     selected_preset: Option<String>,
     toast: Option<Toast>,
     loading: usize,
+    #[cfg(debug_assertions)]
     screenshot: Option<(PathBuf, Instant)>,
 }
 
@@ -249,6 +252,7 @@ impl App {
             selected_preset: None,
             toast: None,
             loading: 0,
+            #[cfg(debug_assertions)]
             screenshot: std::env::var_os("BUTTON_BADGER_SCREENSHOT").map(|p| (PathBuf::from(p), Instant::now() + Duration::from_secs(4))),
         };
         app.sync_texts();
@@ -292,7 +296,10 @@ impl App {
                 _ => None,
             }
         });
-        if self.toast.is_some() || self.screenshot.is_some() {
+        let ticking = self.toast.is_some();
+        #[cfg(debug_assertions)]
+        let ticking = ticking || self.screenshot.is_some();
+        if ticking {
             Subscription::batch([events, time::every(Duration::from_millis(400)).map(Message::Tick)])
         } else {
             events
@@ -828,8 +835,11 @@ impl App {
                 if self.toast.as_ref().is_some_and(|t| now >= t.until) {
                     self.toast = None;
                 }
-                if self.screenshot.as_ref().is_some_and(|(_, at)| now >= *at) {
-                    return window::latest().and_then(window::screenshot).map(Message::Screenshot);
+                #[cfg(debug_assertions)]
+                {
+                    if self.screenshot.as_ref().is_some_and(|(_, at)| now >= *at) {
+                        return window::latest().and_then(window::screenshot).map(Message::Screenshot);
+                    }
                 }
             }
             Message::ToggleDark => {
@@ -838,6 +848,7 @@ impl App {
                 self.settings.save();
                 self.invalidate();
             }
+            #[cfg(debug_assertions)]
             Message::Screenshot(shot) => {
                 if let Some((path, _)) = self.screenshot.take() {
                     let _ = image::save_buffer(&path, &shot.rgba, shot.size.width, shot.size.height, image::ColorType::Rgba8);
