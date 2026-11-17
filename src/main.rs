@@ -17,6 +17,7 @@ use pdf::{Document, Pages};
 use preview::Interaction;
 use settings::{Preset, Settings};
 
+use iced::advanced::widget::{operate, operation::focusable::find_focused};
 use iced::widget::canvas::Cache;
 use iced::widget::image::Handle;
 use iced::{Event, Font, Size, Subscription, Task, Theme, Vector, event, keyboard, time, window};
@@ -59,8 +60,6 @@ enum Field {
 }
 
 impl Field {
-    const FIXED: [Field; 9] = [Field::Face, Field::Bleed, Field::Gap, Field::Margin, Field::PaperW, Field::PaperH, Field::Weight, Field::MeasuredX, Field::MeasuredY];
-
     fn id(self) -> iced::widget::Id {
         iced::widget::Id::from(format!("field-{self:?}"))
     }
@@ -122,9 +121,9 @@ enum Message {
     Text(Field, String),
     Slide(Field, f32),
     Step(Field, f32),
-    /// Up/Down pressed: step whichever field has focus (found via `FocusProbe`).
+    /// Up/Down pressed: step whichever field has focus (found via `StepFocused`).
     ArrowStep(f32),
-    FocusProbe(Field, f32, bool),
+    StepFocused(iced::widget::Id, f32),
     // Sheet settings
     BadgePreset(String),
     Paper(Paper),
@@ -567,11 +566,15 @@ impl App {
             }
             Message::Step(field, dir) => self.step_field(field, dir),
             Message::ArrowStep(dir) => {
-                let fields = Field::FIXED.into_iter().chain((0..self.images.len()).flat_map(|i| [Field::Copies(i), Field::Scale(i), Field::Rotation(i)]));
-                return Task::batch(fields.map(|f| iced::widget::operation::is_focused(f.id()).map(move |yes| Message::FocusProbe(f, dir, yes))));
+                // One pass over the widgets; yields nothing unless a widget with an id has focus.
+                return operate(find_focused()).map(move |id| Message::StepFocused(id, dir));
             }
-            Message::FocusProbe(field, dir, true) => self.step_field(field, dir),
-            Message::FocusProbe(_, _, false) => {}
+            Message::StepFocused(id, dir) => {
+                // `texts` has an entry for every field on screen.
+                if let Some(&field) = self.texts.keys().find(|f| f.id() == id) {
+                    self.step_field(field, dir);
+                }
+            }
 
             Message::BadgePreset(name) => {
                 if let Some(p) = PRESETS.iter().find(|p| p.name == name) {
@@ -917,5 +920,8 @@ mod tests {
         assert_eq!(parse_hex("#F4E7"), None);
         assert_eq!(parse_decimal("2,5"), Some(2.5));
         assert_eq!(parse_decimal("."), None);
+        // Arrow-key stepping finds the focused field by comparing ids.
+        assert_eq!(Field::Copies(2).id(), Field::Copies(2).id());
+        assert_ne!(Field::Copies(2).id(), Field::Copies(1).id());
     }
 }
