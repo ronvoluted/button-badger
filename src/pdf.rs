@@ -1,11 +1,11 @@
-//! Vector PDF output: one shared image XObject per source image, circle clips, dashed guides.
+//! Vector PDF output: one shared XObject per source image (SVGs stay vector), circle clips, dashed guides.
 
 use crate::images::Loaded;
 use crate::layout::{CROP_TICK_END, CROP_TICK_START, INCH, LineStyle, PT_PER_MM, Sheet, TestPage, trim_float};
 use pdf_writer::types::LineCapStyle;
 use pdf_writer::{Content, Filter, Finish, Name, Pdf, Rect, Ref, Str};
 use std::borrow::Cow;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 /// Max resolution embedded for an image, in dots per inch at its printed size.
 const EMBED_DPI: f32 = 600.0;
@@ -53,8 +53,7 @@ impl Document<'_> {
         if let Pages::Badges(pages) = self.pages {
             for &i in pages.iter().flatten().flatten() {
                 if let (None, Some(img)) = (xobjects.get(&i), self.images.get(i)) {
-                    let (id, mask) = (alloc(), alloc());
-                    embed(&mut pdf, id, mask, self.sheet, img);
+                    let id = embed(&mut pdf, &mut alloc, self.sheet, img);
                     xobjects.insert(i, id);
                 }
             }
@@ -187,9 +186,22 @@ fn win_ansi(text: &str) -> Vec<u8> {
         .collect()
 }
 
-fn embed(pdf: &mut Pdf, id: Ref, mask: Ref, sheet: &Sheet, img: &Loaded) {
+/// Write `img` as an XObject filling the unit square and return its id.
+fn embed(pdf: &mut Pdf, alloc: &mut impl FnMut() -> Ref, sheet: &Sheet, img: &Loaded) -> Ref {
     let r = sheet.image_rect(img.width(), img.height(), img.zoom, img.offset_mm);
     let max_w = ((r.w / INCH) * EMBED_DPI).ceil() as u32;
+    // SVGs go in as vectors. Only filter effects are rasterised, at EMBED_DPI like bitmaps.
+    // Text is outlined rather than embedded with its font, so it prints exactly as previewed.
+    if let Some(tree) = &img.svg {
+        let options = svg2pdf::ConversionOptions { raster_scale: max_w as f32 / tree.size().width(), embed_text: false, ..Default::default() };
+        // A tree svg2pdf can't convert falls through to the bitmap below.
+        if let Ok((chunk, root)) = svg2pdf::to_chunk(tree, options) {
+            let mut ids = HashMap::new();
+            chunk.renumber_into(pdf, |old| *ids.entry(old).or_insert_with(&mut *alloc));
+            return ids[&root];
+        }
+    }
+    let (id, mask) = (alloc(), alloc());
     let src = if img.width() > max_w {
         let s = max_w as f32 / img.width() as f32;
         let h = ((img.height() as f32 * s).round() as u32).max(1);
@@ -217,6 +229,7 @@ fn embed(pdf: &mut Pdf, id: Ref, mask: Ref, sheet: &Sheet, img: &Loaded) {
         m.color_space().device_gray();
         m.finish();
     }
+    id
 }
 
 fn circle(c: &mut Content, cx: f32, cy: f32, r: f32) {
@@ -290,6 +303,7 @@ mod tests {
             name: "sample".into(),
             full: Arc::new(img.clone()),
             preview: Arc::new(img),
+            svg: None,
             has_alpha: true,
             qty: 0,
             zoom: 1.0,
@@ -308,6 +322,16 @@ mod tests {
         assert!(bytes.starts_with(b"%PDF-"));
         // One image + one soft mask, regardless of how many cells use it.
         assert_eq!(String::from_utf8_lossy(&bytes).matches("/Subtype /Image").count(), 2);
+
+        // An SVG is embedded as a vector form, not as pixels.
+        let svg = br##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 40 30"><defs><linearGradient id="g"><stop stop-color="#e33"/><stop offset="1" stop-color="#33e"/></linearGradient></defs><rect width="40" height="30" fill="url(#g)"/><circle cx="12" cy="10" r="8" fill="#fff" stroke="#000"/></svg>"##;
+        let tree = resvg::usvg::Tree::from_data(svg, &Default::default()).unwrap();
+        let images = [Loaded { svg: Some(Arc::new(tree)), ..sample() }];
+        let doc = Document { images: &images, ..doc };
+        let bytes = doc.pdf();
+        let text = String::from_utf8_lossy(&bytes);
+        assert_eq!(text.matches("/Subtype /Image").count(), 0);
+        assert!(text.contains("/Subtype /Form"));
 
         for paper in [Paper::A4, Paper::A6] {
             let sheet = Sheet { paper, ..Sheet::default() };

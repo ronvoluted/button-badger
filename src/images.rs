@@ -1,11 +1,11 @@
-//! Loading images (raster + SVG) and compositing a single badge bitmap.
+//! Loading images (raster + SVG, which also keeps its vector tree) and compositing a single badge bitmap.
 
 use crate::layout::Sheet;
 use image::imageops::{self, FilterType};
 use image::{DynamicImage, ImageDecoder, ImageReader, Rgba, RgbaImage};
 use std::borrow::Cow;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 const MAX_FULL: u32 = 4096;
 const MAX_PREVIEW: u32 = 1024;
@@ -19,6 +19,8 @@ pub struct Loaded {
     pub full: Arc<RgbaImage>,
     /// Small copy used for the live preview.
     pub preview: Arc<RgbaImage>,
+    /// The parsed SVG, embedded as vectors in the PDF; `full` is then only its bitmap for preview and raster printing.
+    pub svg: Option<Arc<resvg::usvg::Tree>>,
     pub has_alpha: bool,
     pub qty: u32,
     pub zoom: f32,
@@ -49,7 +51,7 @@ pub fn wrap_degrees(deg: f32) -> f32 {
 
 pub fn load(path: &Path) -> Result<Loaded, String> {
     let file = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-    let dyn_img = decode(path).map_err(|e| format!("Couldn't open {file}: {e}"))?;
+    let (dyn_img, svg) = decode(path).map_err(|e| format!("Couldn't open {file}: {e}"))?;
     let has_alpha = dyn_img.color().has_alpha();
     let mut full = dyn_img.into_rgba8();
     if full.width().max(full.height()) > MAX_FULL {
@@ -65,6 +67,7 @@ pub fn load(path: &Path) -> Result<Loaded, String> {
         name,
         preview,
         full,
+        svg,
         has_alpha,
         qty: 0,
         zoom: 1.0,
@@ -73,11 +76,12 @@ pub fn load(path: &Path) -> Result<Loaded, String> {
     })
 }
 
-fn decode(path: &Path) -> Result<DynamicImage, String> {
+fn decode(path: &Path) -> Result<(DynamicImage, Option<Arc<resvg::usvg::Tree>>), String> {
     let ext = path.extension().map(|e| e.to_string_lossy().to_ascii_lowercase()).unwrap_or_default();
     if ext == "svg" || ext == "svgz" {
         let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
-        return svg(&bytes).map(DynamicImage::ImageRgba8);
+        let tree = parse_svg(&bytes)?;
+        return Ok((DynamicImage::ImageRgba8(rasterise(&tree)?), Some(Arc::new(tree))));
     }
     let reader = ImageReader::open(path)
         .map_err(|e| e.to_string())?
@@ -87,7 +91,7 @@ fn decode(path: &Path) -> Result<DynamicImage, String> {
     let orientation = decoder.orientation().unwrap_or(image::metadata::Orientation::NoTransforms);
     let mut img = DynamicImage::from_decoder(decoder).map_err(friendly)?;
     img.apply_orientation(orientation);
-    Ok(img)
+    Ok((img, None))
 }
 
 fn friendly(e: image::ImageError) -> String {
@@ -99,14 +103,26 @@ fn friendly(e: image::ImageError) -> String {
     }
 }
 
-fn svg(bytes: &[u8]) -> Result<RgbaImage, String> {
+/// System fonts for SVG text, scanned once on the first SVG load.
+static FONTS: LazyLock<Arc<resvg::usvg::fontdb::Database>> = LazyLock::new(|| {
+    let mut db = resvg::usvg::fontdb::Database::new();
+    db.load_system_fonts();
+    Arc::new(db)
+});
+
+fn parse_svg(bytes: &[u8]) -> Result<resvg::usvg::Tree, String> {
+    let options = resvg::usvg::Options { fontdb: Arc::clone(&FONTS), ..Default::default() };
+    resvg::usvg::Tree::from_data(bytes, &options).map_err(|e| e.to_string())
+}
+
+/// Bitmap of an SVG for the preview and raster printing (the PDF embeds the tree itself).
+fn rasterise(tree: &resvg::usvg::Tree) -> Result<RgbaImage, String> {
     use resvg::tiny_skia::{Pixmap, Transform};
-    let tree = resvg::usvg::Tree::from_data(bytes, &resvg::usvg::Options::default()).map_err(|e| e.to_string())?;
     let size = tree.size();
     let scale = 2048.0 / size.width().max(size.height()).max(1.0);
     let (w, h) = ((size.width() * scale).ceil() as u32, (size.height() * scale).ceil() as u32);
     let mut pixmap = Pixmap::new(w.max(1), h.max(1)).ok_or("SVG too large")?;
-    resvg::render(&tree, Transform::from_scale(scale, scale), &mut pixmap.as_mut());
+    resvg::render(tree, Transform::from_scale(scale, scale), &mut pixmap.as_mut());
     let mut out = RgbaImage::new(pixmap.width(), pixmap.height());
     for (dst, src) in out.pixels_mut().zip(pixmap.pixels()) {
         let c = src.demultiply();
@@ -217,6 +233,16 @@ mod tests {
     use super::*;
 
     #[test]
+    fn svg_text_is_drawn() {
+        if FONTS.is_empty() {
+            return; // a machine with no fonts installed can't draw text
+        }
+        let svg = br#"<svg xmlns="http://www.w3.org/2000/svg" width="200" height="60"><text x="10" y="40" font-size="32">Badger</text></svg>"#;
+        let tree = parse_svg(svg).unwrap();
+        assert!(rasterise(&tree).unwrap().pixels().any(|p| p[3] > 0), "text left no pixels");
+    }
+
+    #[test]
     fn rotating_90_matches_rotated_pixels() {
         // A wide, two-tone image: rotating the placement must look like rotating the pixels.
         let src = RgbaImage::from_fn(60, 30, |x, _| if x < 20 { Rgba([255, 0, 0, 255]) } else { Rgba([0, 0, 255, 255]) });
@@ -225,6 +251,7 @@ mod tests {
             name: String::new(),
             full: Arc::new(pixels.clone()),
             preview: Arc::new(pixels),
+            svg: None,
             has_alpha: false,
             qty: 0,
             zoom: 1.0,

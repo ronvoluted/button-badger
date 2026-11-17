@@ -9,7 +9,8 @@ description = "Auto-align images for printing as button/badge template cutouts"
 iced = { version = "0.14.0", features = ["image", "svg", "canvas", "advanced", "tokio"] }
 image = "0.25"
 rfd = "0.17"
-pdf-writer = "0.15"
+pdf-writer = "0.12" # pinned by svg2pdf, whose chunks are spliced into our PDF
+svg2pdf = { version = "0.13", default-features = false, features = ["image", "filters", "text"] }
 miniz_oxide = "0.8"
 resvg = "0.45"
 serde = { version = "1", features = ["derive"] }
