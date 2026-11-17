@@ -244,7 +244,7 @@ const DEFAULT_CUSTOM_BG: &str = "#F4E7D3";
 
 impl App {
     fn boot() -> (App, Task<Message>) {
-        let settings = Settings::load();
+        let (settings, unreadable) = Settings::load();
         let mut app = App {
             dark: settings.dark.unwrap_or(false),
             bg_hex: settings.sheet.background.filter(|b| *b != [1.0; 3]).map(hex_of).unwrap_or_else(|| DEFAULT_CUSTOM_BG.into()),
@@ -264,7 +264,8 @@ impl App {
             texts: HashMap::new(),
             preset_name: String::new(),
             selected_preset: None,
-            toast: None,
+            // Long enough to be read: this is the only notice that a settings file was set aside.
+            toast: unreadable.map(|(text, path)| Toast { text, path: Some(path), error: true, until: Instant::now() + Duration::from_secs(30) }),
             loading: 0,
             #[cfg(debug_assertions)]
             screenshot: std::env::var_os("BUTTON_BADGER_SCREENSHOT").map(|p| (PathBuf::from(p), Instant::now() + Duration::from_secs(4))),
@@ -334,6 +335,13 @@ impl App {
 
     fn units(&self) -> Units {
         self.sheet().units
+    }
+
+    /// Show a failed settings write in the toast, over whatever it was saying.
+    fn saved(&mut self, result: Result<(), String>) {
+        if let Err(e) = result {
+            self.toast = Toast::error(e);
+        }
     }
 
     fn text(&self, f: Field) -> &str {
@@ -533,7 +541,8 @@ impl App {
                 self.loading = self.loading.saturating_sub(1);
                 match result {
                     Ok(img) => {
-                        self.settings.remember(&img.path);
+                        let saved = self.settings.remember(&img.path);
+                        self.saved(saved);
                         self.badges.push(self.compose(&img));
                         self.images.push(img);
                         self.sync_image_texts();
@@ -561,7 +570,8 @@ impl App {
                             img.zoom = old.zoom;
                             img.offset_mm = old.offset_mm;
                             img.rotation = old.rotation;
-                            self.settings.remember(&img.path);
+                            let saved = self.settings.remember(&img.path);
+                            self.saved(saved);
                             self.images[i] = img;
                             self.image_changed(i);
                         }
@@ -785,10 +795,10 @@ impl App {
                 presets.retain(|p| p.name != name);
                 presets.push(Preset { name: name.clone(), sheet: self.settings.sheet.clone() });
                 presets.sort_by(|a, b| a.name.cmp(&b.name));
-                self.settings.save();
                 self.toast = Toast::info(format!("Setup “{name}” saved"));
                 self.selected_preset = Some(name);
                 self.preset_name.clear();
+                self.saved(self.settings.save());
             }
             Message::LoadPreset(name) => {
                 if let Some(p) = self.settings.presets.iter().find(|p| p.name == name) {
@@ -804,8 +814,8 @@ impl App {
             Message::DeletePresetConfirmed(yes) => {
                 if yes && let Some(name) = self.selected_preset.take() {
                     self.settings.presets.retain(|p| p.name != name);
-                    self.settings.save();
                     self.toast = Toast::info(format!("Deleted “{name}”"));
+                    self.saved(self.settings.save());
                 }
             }
             Message::ResetDefaults => {
@@ -829,7 +839,7 @@ impl App {
             Message::CalibrationPaper(p) => {
                 self.settings.calibration_paper = p;
                 self.reset_measured();
-                self.settings.save();
+                self.saved(self.settings.save());
             }
             Message::ApplyCalibration => {
                 let rule = TestPage::new(&self.calibration_sheet()).rule;
@@ -838,8 +848,8 @@ impl App {
                 match (measured(Field::MeasuredX), measured(Field::MeasuredY)) {
                     (Some(x), Some(y)) => {
                         self.settings.calibration = (rule / x, rule / y);
-                        self.settings.save();
                         self.toast = Toast::info(format!("Calibrated: ×{:.4} across, ×{:.4} down", rule / x, rule / y));
+                        self.saved(self.settings.save());
                     }
                     _ => self.toast = Toast::error(format!("Enter the measured lengths of the {} mm rules, in mm", trim_float(rule, 0))),
                 }
@@ -847,10 +857,10 @@ impl App {
             Message::ResetCalibration => {
                 self.settings.calibration = (1.0, 1.0);
                 self.reset_measured();
-                self.settings.save();
+                self.saved(self.settings.save());
             }
 
-            Message::FocusLost => settings::flush(),
+            Message::FocusLost => self.saved(settings::flush()),
             Message::DismissToast => self.toast = None,
             Message::Tick(now) => {
                 if self.toast.as_ref().is_some_and(|t| now >= t.until) {
@@ -872,7 +882,7 @@ impl App {
             Message::ToggleDark => {
                 self.dark = !self.dark;
                 self.settings.dark = Some(self.dark);
-                self.settings.save();
+                self.saved(self.settings.save());
                 self.invalidate();
             }
             #[cfg(debug_assertions)]
