@@ -1,116 +1,129 @@
-//! Bitmap page renderer (used for Windows printing). Same geometry as the PDF path.
+//! Bitmap page renderer (used for Windows printing). Same geometry as the PDF path: everything is drawn in mm
+//! through one mm → pixel transform, in horizontal bands so a page is never held in memory whole.
 #![cfg_attr(not(windows), allow(dead_code))]
 
 use crate::images::compose;
 use crate::layout::{CROP_TICK_END, CROP_TICK_START, INCH, LineStyle, PT_PER_MM, TestPage};
 use crate::pdf::{Document, Pages};
+use image::imageops::{self, FilterType};
 use image::{Rgba, RgbaImage};
+use resvg::tiny_skia::{FillRule, LineCap, Paint, PathBuilder, PixmapMut, Stroke, StrokeDash, Transform};
 use std::collections::HashMap;
 
-/// Render page `n` of `doc` as an opaque white bitmap at the given resolution (dots per inch, x and y).
-pub fn render_page(doc: &Document, n: usize, dpi: (f32, f32)) -> RgbaImage {
+/// Composited badge per image index. Keep one for the whole print job so each image is composed once.
+pub type Badges = HashMap<usize, RgbaImage>;
+
+/// Page size in pixels at `dpi` (dots per inch, x and y).
+pub fn page_px(doc: &Document, dpi: (f32, f32)) -> (u32, u32) {
+    let (w_mm, h_mm) = doc.sheet.page_mm();
+    (((w_mm * dpi.0 / INCH).round() as u32).max(1), ((h_mm * dpi.1 / INCH).round() as u32).max(1))
+}
+
+/// Render pixel rows `y0..y0 + rows` of page `n` as an opaque white-backed bitmap at `dpi`.
+pub fn render_band(doc: &Document, n: usize, dpi: (f32, f32), y0: u32, rows: u32, badges: &mut Badges) -> RgbaImage {
     let sheet = doc.sheet;
     let (w_mm, h_mm) = sheet.page_mm();
-    let ppm = (dpi.0 / INCH, dpi.1 / INCH);
-    let (w, h) = (((w_mm * ppm.0).round() as u32).max(1), ((h_mm * ppm.1).round() as u32).max(1));
-    let mut page = RgbaImage::from_pixel(w, h, Rgba([255, 255, 255, 255]));
-    // mm → px, scaling about the page centre for calibration.
-    let (sx, sy) = doc.calibration;
-    let to_px = |(x, y): (f32, f32)| ((w_mm / 2.0 + sx * (x - w_mm / 2.0)) * ppm.0, (h_mm / 2.0 + sy * (y - h_mm / 2.0)) * ppm.1);
-    let s_px = ppm.0 * sx; // px per mm after calibration (x axis)
+    let mut band = RgbaImage::from_pixel(page_px(doc, dpi).0, rows.max(1), Rgba([255; 4]));
+    // Pixels per mm on each axis. The printer's resolution and the calibration can both differ between x and y.
+    let (kx, ky) = (dpi.0 / INCH * doc.calibration.0, dpi.1 / INCH * doc.calibration.1);
+    // mm → page pixels, scaling about the page centre like the PDF's page transform. `at` is the same for a point.
+    let (tx, ty) = (w_mm / 2.0 * (dpi.0 / INCH - kx), h_mm / 2.0 * (dpi.1 / INCH - ky));
+    let t = Transform::from_row(kx, 0.0, 0.0, ky, tx, ty - y0 as f32);
+    let hair = 1.0 / kx.min(ky); // one pixel in mm: no line is drawn thinner
+    let cut_r = sheet.cut_mm() / 2.0;
 
     match doc.pages {
         Pages::Badges(pages) => {
             let items = pages.get(n).map_or(&[][..], Vec::as_slice);
-            let cut_px = (sheet.cut_mm() * s_px).round() as u32;
-            let lw = sheet.guides.weight_pt / PT_PER_MM * s_px;
-            let mut badges: HashMap<usize, RgbaImage> = HashMap::new();
-            for (i, cell) in sheet.cells().into_iter().enumerate() {
-                let (cx, cy) = to_px(cell);
+            let (bw, bh) = (((sheet.cut_mm() * kx).round() as u32).max(2), ((sheet.cut_mm() * ky).round() as u32).max(2));
+            let reach = (cut_r + CROP_TICK_END + 1.0) * ky; // how far a cell draws above and below its centre, px
+            for (i, (cx, cy)) in sheet.cells().into_iter().enumerate() {
+                let (px, py) = (kx * cx + tx, ky * cy + ty);
+                if py + reach < y0 as f32 || py - reach > (y0 + rows) as f32 {
+                    continue;
+                }
                 if let Some(i) = items.get(i).copied().flatten()
                     && let Some(img) = doc.images.get(i)
                 {
-                    let badge = badges.entry(i).or_insert_with(|| compose(sheet, img, &img.full, cut_px));
-                    let half = cut_px as f32 / 2.0;
-                    image::imageops::overlay(&mut page, badge, (cx - half).round() as i64, (cy - half).round() as i64);
-                } else if let Some(bg) = sheet.background {
-                    disc(&mut page, cx, cy, sheet.cut_mm() / 2.0 * s_px, bg.map(|v| (v * 255.0) as u8));
+                    let badge = badges.entry(i).or_insert_with(|| {
+                        // `compose` makes square badges; squash to the device's pixel shape when the axes differ.
+                        let square = compose(sheet, img, &img.full, bw.max(bh));
+                        if bw == bh { square } else { imageops::resize(&square, bw, bh, FilterType::Triangle) }
+                    });
+                    let (x, y) = ((px - bw as f32 / 2.0).round() as i64, (py - bh as f32 / 2.0).round() as i64);
+                    imageops::overlay(&mut band, badge, x, y - y0 as i64);
+                } else if let (Some(bg), Some(disc)) = (sheet.background, PathBuilder::from_circle(cx, cy, cut_r)) {
+                    canvas(&mut band).fill_path(&disc, &paint(bg.map(|v| (v * 255.0) as u8)), FillRule::Winding, t, None);
                 }
-                guides(&mut page, doc, cx, cy, s_px, lw);
+                guides(&mut band, t, doc, cx, cy, hair);
             }
         }
         Pages::TestPage => {
-            let t = TestPage::new(sheet);
-            for [a, b] in t.segments() {
-                line(&mut page, to_px(a), to_px(b), (0.25 * s_px).max(1.0), [0, 0, 0]);
+            let test = TestPage::new(sheet);
+            let mut rules = PathBuilder::new();
+            for [a, b] in test.segments() {
+                rules.move_to(a.0, a.1);
+                rules.line_to(b.0, b.1);
             }
-            let (bx, by) = to_px(t.badge);
+            let black = paint([0; 3]);
+            let mut c = canvas(&mut band);
+            if let (Some(rules), Some(s)) = (rules.finish(), stroke(LineStyle::Solid, 0.25f32.max(hair))) {
+                c.stroke_path(&rules, &black, &s, t, None);
+            }
+            // Both circles solid and thin so they can be measured, whatever the guide style.
+            let (bx, by) = test.badge;
             for d in [sheet.cut_mm(), sheet.face_mm] {
-                stroke_circle(&mut page, bx, by, d / 2.0 * s_px, LineStyle::Solid, 0.2 * s_px, [0, 0, 0]);
-            }
-        }
-    }
-    page
-}
-
-fn guides(page: &mut RgbaImage, doc: &Document, cx: f32, cy: f32, s_px: f32, lw: f32) {
-    let g = &doc.sheet.guides;
-    let v = (g.gray * 255.0) as u8;
-    let col = [v, v, v];
-    let cut_r = doc.sheet.cut_mm() / 2.0 * s_px;
-    stroke_circle(page, cx, cy, cut_r, g.cut, lw, col);
-    if g.crop_marks {
-        let (a, b) = (cut_r + CROP_TICK_START * s_px, cut_r + CROP_TICK_END * s_px);
-        line(page, (cx, cy - a), (cx, cy - b), lw, col);
-        line(page, (cx, cy + a), (cx, cy + b), lw, col);
-        line(page, (cx - a, cy), (cx - b, cy), lw, col);
-        line(page, (cx + a, cy), (cx + b, cy), lw, col);
-    }
-}
-
-/// Stroke a circle by stamping discs along it (dotted/dashed/solid patterns, same ratios as the PDF).
-fn stroke_circle(page: &mut RgbaImage, cx: f32, cy: f32, r: f32, style: LineStyle, lw: f32, col: [u8; 3]) {
-    let lw = lw.max(1.0);
-    // (distance between stamps, "on" length, pattern period), all along the circumference.
-    let (step, on, period) = match style {
-        LineStyle::Dotted => (lw * 3.0, lw * 0.01, lw * 3.0),
-        LineStyle::Dashed => (lw / 3.0, lw * 6.0, lw * 10.0),
-        LineStyle::Solid => (lw / 3.0, f32::INFINITY, 1.0),
-        LineStyle::None => return,
-    };
-    let mut d = 0.0;
-    while d < std::f32::consts::TAU * r {
-        if d % period <= on {
-            let a = d / r;
-            disc(page, cx + a.cos() * r, cy + a.sin() * r, lw / 2.0, col);
-        }
-        d += step;
-    }
-}
-
-fn line(page: &mut RgbaImage, a: (f32, f32), b: (f32, f32), lw: f32, col: [u8; 3]) {
-    let len = (b.0 - a.0).hypot(b.1 - a.1);
-    let steps = (len / (lw / 3.0).max(0.5)).ceil().max(1.0);
-    for i in 0..=steps as u32 {
-        let t = i as f32 / steps;
-        disc(page, a.0 + (b.0 - a.0) * t, a.1 + (b.1 - a.1) * t, lw / 2.0, col);
-    }
-}
-
-/// Blend an anti-aliased filled circle onto the page.
-fn disc(page: &mut RgbaImage, cx: f32, cy: f32, r: f32, col: [u8; 3]) {
-    let r = r.max(0.5);
-    let (x0, x1) = ((cx - r - 1.0).floor().max(0.0) as u32, ((cx + r + 1.0).ceil() as u32).min(page.width()));
-    let (y0, y1) = ((cy - r - 1.0).floor().max(0.0) as u32, ((cy + r + 1.0).ceil() as u32).min(page.height()));
-    for y in y0..y1 {
-        for x in x0..x1 {
-            let cov = (r + 0.5 - (x as f32 + 0.5 - cx).hypot(y as f32 + 0.5 - cy)).clamp(0.0, 1.0);
-            if cov > 0.0 {
-                let p = page.get_pixel_mut(x, y);
-                for k in 0..3 {
-                    p[k] = (p[k] as f32 * (1.0 - cov) + col[k] as f32 * cov) as u8;
+                if let (Some(circle), Some(s)) = (PathBuilder::from_circle(bx, by, d / 2.0), stroke(LineStyle::Solid, 0.2f32.max(hair))) {
+                    c.stroke_path(&circle, &black, &s, t, None);
                 }
             }
+        }
+    }
+    band
+}
+
+/// The band as a tiny-skia canvas. It is opaque, so its straight RGBA is also valid premultiplied RGBA.
+fn canvas(band: &mut RgbaImage) -> PixmapMut<'_> {
+    let (w, h) = band.dimensions();
+    PixmapMut::from_bytes(band, w, h).expect("an RGBA buffer of its own size")
+}
+
+fn paint(col: [u8; 3]) -> Paint<'static> {
+    let mut p = Paint::default();
+    p.set_color_rgba8(col[0], col[1], col[2], 255);
+    p
+}
+
+/// Stroke for a guide line `lw` mm wide: the same caps and dash ratios as `pdf::dash`.
+fn stroke(style: LineStyle, lw: f32) -> Option<Stroke> {
+    let (line_cap, dash) = match style {
+        LineStyle::None => return None,
+        LineStyle::Solid => (LineCap::Butt, None),
+        LineStyle::Dashed => (LineCap::Butt, StrokeDash::new(vec![lw * 6.0, lw * 4.0], 0.0)),
+        // A (near) zero-length dash with a round cap is a dot.
+        LineStyle::Dotted => (LineCap::Round, StrokeDash::new(vec![lw * 0.01, lw * 2.99], 0.0)),
+    };
+    Some(Stroke { width: lw, line_cap, dash, ..Default::default() })
+}
+
+fn guides(band: &mut RgbaImage, t: Transform, doc: &Document, cx: f32, cy: f32, hair: f32) {
+    let g = &doc.sheet.guides;
+    let gray = paint([(g.gray * 255.0) as u8; 3]);
+    let lw = (g.weight_pt / PT_PER_MM).max(hair);
+    let cut_r = doc.sheet.cut_mm() / 2.0;
+    let mut c = canvas(band);
+    if let (Some(s), Some(circle)) = (stroke(g.cut, lw), PathBuilder::from_circle(cx, cy, cut_r)) {
+        c.stroke_path(&circle, &gray, &s, t, None);
+    }
+    if g.crop_marks {
+        let (a, b) = (cut_r + CROP_TICK_START, cut_r + CROP_TICK_END);
+        let mut ticks = PathBuilder::new();
+        for (dx, dy) in [(0.0, -1.0), (0.0, 1.0), (-1.0, 0.0), (1.0, 0.0)] {
+            ticks.move_to(cx + dx * a, cy + dy * a);
+            ticks.line_to(cx + dx * b, cy + dy * b);
+        }
+        if let (Some(ticks), Some(s)) = (ticks.finish(), stroke(LineStyle::Solid, lw)) {
+            c.stroke_path(&ticks, &gray, &s, t, None);
         }
     }
 }
@@ -120,21 +133,66 @@ mod tests {
     use super::*;
     use crate::layout::{Guides, Sheet};
 
-    #[test]
-    fn cut_circle_diameter_in_pixels() {
-        // A4 at 100 dpi with solid cut circles: measure the first one across its middle row.
-        let sheet = Sheet { guides: Guides { cut: LineStyle::Solid, ..Default::default() }, ..Sheet::default() };
-        let pages = vec![vec![None; sheet.cells().len()]];
-        let doc = Document { sheet: &sheet, images: &[], pages: Pages::Badges(&pages), calibration: (1.0, 1.0), title: "t" };
-        let page = render_page(&doc, 0, (100.0, 100.0));
-        let (cx, cy) = sheet.cells()[0];
-        let ppm = 100.0 / INCH;
-        let row = (cy * ppm) as u32;
-        // Ignore the neighbouring circles: only look within ~one radius of this centre.
-        let dark: Vec<u32> = (0..page.width())
-            .filter(|&x| page.get_pixel(x, row)[0] < 200 && (x as f32 - cx * ppm).abs() < sheet.cut_mm() * ppm * 0.52)
+    fn page(doc: &Document, dpi: (f32, f32)) -> RgbaImage {
+        render_band(doc, 0, dpi, 0, page_px(doc, dpi).1, &mut Badges::new())
+    }
+
+    /// Printed extent in mm of the dark pixels along a row (`across`) or column through the centre of a cell
+    /// in the middle of the page, ignoring the neighbouring circles.
+    fn circle_mm(doc: &Document, dpi: (f32, f32), across: bool) -> f32 {
+        let page = page(doc, dpi);
+        let (w_mm, h_mm) = doc.sheet.page_mm();
+        let cells = doc.sheet.cells();
+        let (cx, cy) = cells[cells.len() / 2];
+        let (kx, ky) = (dpi.0 / INCH * doc.calibration.0, dpi.1 / INCH * doc.calibration.1);
+        let (px, py) = (kx * cx + w_mm / 2.0 * (dpi.0 / INCH - kx), ky * cy + h_mm / 2.0 * (dpi.1 / INCH - ky));
+        let (centre, k, len) = if across { (px, kx, page.width()) } else { (py, ky, page.height()) };
+        let dark: Vec<u32> = (0..len)
+            .filter(|&i| {
+                let p = if across { page.get_pixel(i, py as u32) } else { page.get_pixel(px as u32, i) };
+                p[0] < 200 && (i as f32 - centre).abs() < doc.sheet.cut_mm() * k * 0.52
+            })
             .collect();
-        let measured_mm = (dark.last().unwrap() - dark[0]) as f32 / ppm;
-        assert!((measured_mm - sheet.cut_mm()).abs() < 1.0, "measured {measured_mm} vs {}", sheet.cut_mm());
+        (dark.last().unwrap() - dark[0]) as f32 / (if across { dpi.0 } else { dpi.1 } / INCH)
+    }
+
+    #[test]
+    fn cut_circle_keeps_its_size_on_both_axes() {
+        let sheet = Sheet { guides: Guides { cut: LineStyle::Solid, crop_marks: false, ..Default::default() }, ..Sheet::default() };
+        let pages = vec![vec![None; sheet.cells().len()]];
+        let doc = |calibration| Document { sheet: &sheet, images: &[], pages: Pages::Badges(&pages), calibration, title: "t" };
+        let cut = sheet.cut_mm();
+        // Square pixels, no calibration.
+        let plain = doc((1.0, 1.0));
+        for across in [true, false] {
+            let mm = circle_mm(&plain, (100.0, 100.0), across);
+            assert!((mm - cut).abs() < 1.0, "plain: measured {mm} vs {cut}");
+        }
+        // A printer with twice the resolution down the page, and a 10% correction on that axis only.
+        let skewed = doc((1.0, 1.1));
+        let (wide, tall) = (circle_mm(&skewed, (100.0, 200.0), true), circle_mm(&skewed, (100.0, 200.0), false));
+        assert!((wide - cut).abs() < 1.0, "skewed: {wide} mm wide vs {cut}");
+        assert!((tall - cut * 1.1).abs() < 1.0, "skewed: {tall} mm tall vs {}", cut * 1.1);
+    }
+
+    #[test]
+    fn bands_stitch_into_the_same_page() {
+        // Badges, dotted circles, crop marks and coloured discs, cut into bands that split them mid-way.
+        let sheet = Sheet { background: Some([0.9, 0.6, 0.2]), guides: Guides { cut: LineStyle::Dotted, crop_marks: true, ..Default::default() }, ..Sheet::default() };
+        let images = [crate::pdf::tests::sample()];
+        let pages = crate::layout::paginate(&sheet.cells(), &[4]);
+        let doc = Document { sheet: &sheet, images: &images, pages: Pages::Badges(&pages), calibration: (1.01, 0.99), title: "t" };
+        let dpi = (150.0, 150.0);
+        let whole = page(&doc, dpi);
+        let (mut stitched, mut badges) = (Vec::new(), Badges::new());
+        for y0 in (0..whole.height()).step_by(97) {
+            stitched.extend(render_band(&doc, 0, dpi, y0, 97.min(whole.height() - y0), &mut badges).into_raw());
+        }
+        assert_eq!(stitched.len(), whole.as_raw().len());
+        // tiny-skia flattens a curve that crosses the band edge slightly differently, so edge pixels may differ
+        // by a fraction of their coverage. A band drawn one row out would differ by far more than this.
+        let worst = stitched.iter().zip(whole.as_raw()).map(|(a, b)| a.abs_diff(*b)).max().unwrap();
+        assert!(worst <= 64, "a band differs from the whole page by {worst}/255");
+        assert!(whole.pixels().any(|p| p[0] != 255), "nothing was drawn");
     }
 }

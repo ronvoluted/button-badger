@@ -287,12 +287,13 @@ fn dash(c: &mut Content, style: LineStyle, lw: f32) {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::layout::Paper;
     use std::sync::Arc;
 
-    fn sample() -> Loaded {
+    /// A small checkerboard of opaque and transparent squares.
+    pub(crate) fn sample() -> Loaded {
         let mut img = image::RgbaImage::new(400, 300);
         for (x, y, p) in img.enumerate_pixels_mut() {
             let a = if (x / 50 + y / 50) % 2 == 0 { 255 } else { 0 };

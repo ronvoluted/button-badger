@@ -35,11 +35,23 @@ fn main() -> iced::Result {
         .window(window::Settings {
             size: Size::new(1280.0, 840.0),
             min_size: Some(Size::new(520.0, 400.0)),
-            icon: window::icon::from_file_data(include_bytes!("../packaging/icon-256.png"), None).ok(),
+            icon: image::load_from_memory(include_bytes!("../packaging/icon-256.png"))
+                .ok()
+                .and_then(|i| window::icon::from_rgba(i.to_rgba8().into_raw(), i.width(), i.height()).ok()),
             ..Default::default()
         })
         .centered()
         .run()
+}
+
+/// Show the system print dialog for `doc`. The toast is the status line plus `note`.
+fn print_task(doc: &Document, note: String) -> Task<Message> {
+    let done = move |r: Result<String, String>| Message::Printed(r.map(|msg| msg + &note));
+    // The macOS and Windows dialogs are modal and block; they have to run here, on the main thread.
+    #[cfg(any(target_os = "macos", windows))]
+    return Task::done(done(print::print(doc)));
+    #[cfg(not(any(target_os = "macos", windows)))]
+    Task::perform(print::print(doc.pdf(), doc.title.to_string()), done)
 }
 
 /// Every numeric text field. Each keeps its own text so half-typed values ("3.") survive.
@@ -147,6 +159,7 @@ enum Message {
     Exported(Result<PathBuf, String>),
     Print,
     PrintTest,
+    Printed(Result<String, String>),
     Reveal(PathBuf),
     // Presets and calibration
     PresetName(String),
@@ -165,6 +178,8 @@ enum Message {
     DismissToast,
     Tick(Instant),
     ToggleDark,
+    /// The system's light/dark setting, followed until the user picks one.
+    SystemTheme(iced::theme::Mode),
     /// Dev aid, debug builds only: `BUTTON_BADGER_SCREENSHOT=out.png` saves a window capture a few seconds
     /// after launch and exits.
     #[cfg(debug_assertions)]
@@ -230,9 +245,8 @@ const DEFAULT_CUSTOM_BG: &str = "#F4E7D3";
 impl App {
     fn boot() -> (App, Task<Message>) {
         let settings = Settings::load();
-        let dark = settings.dark.unwrap_or_else(|| matches!(dark_light::detect(), Ok(dark_light::Mode::Dark)));
         let mut app = App {
-            dark,
+            dark: settings.dark.unwrap_or(false),
             bg_hex: settings.sheet.background.filter(|b| *b != [1.0; 3]).map(hex_of).unwrap_or_else(|| DEFAULT_CUSTOM_BG.into()),
             bg_mode: bg_mode_of(settings.sheet.background),
             settings,
@@ -260,8 +274,11 @@ impl App {
         app.relayout();
         // Files passed on the command line (e.g. "Open with…") load straight away.
         let args: Vec<PathBuf> = std::env::args_os().skip(1).map(PathBuf::from).filter(|p| p.is_file()).collect();
-        let task = Task::batch(args.into_iter().map(|p| app.add_image(p)));
-        (app, task)
+        let mut tasks: Vec<_> = args.into_iter().map(|p| app.add_image(p)).collect();
+        if app.settings.dark.is_none() {
+            tasks.push(iced::system::theme().map(Message::SystemTheme));
+        }
+        (app, Task::batch(tasks))
     }
 
     fn theme(&self) -> Theme {
@@ -296,14 +313,17 @@ impl App {
                 _ => None,
             }
         });
+        let mut subs = vec![events];
+        if self.settings.dark.is_none() {
+            subs.push(iced::system::theme_changes().map(Message::SystemTheme));
+        }
         let ticking = self.toast.is_some();
         #[cfg(debug_assertions)]
         let ticking = ticking || self.screenshot.is_some();
         if ticking {
-            Subscription::batch([events, time::every(Duration::from_millis(400)).map(Message::Tick)])
-        } else {
-            events
+            subs.push(time::every(Duration::from_millis(400)).map(Message::Tick));
         }
+        Subscription::batch(subs)
     }
 
     // ---- derived state ----
@@ -744,14 +764,15 @@ impl App {
                     return Task::none();
                 }
                 let doc = Document { sheet: self.sheet(), images: &self.images, pages: Pages::Badges(&self.pages), calibration: self.settings.calibration, title: "Button Badger" };
-                self.toast = Toast::result(print::print(&doc));
+                return print_task(&doc, String::new());
             }
             Message::PrintTest => {
                 let rule = self.reset_measured();
                 let sheet = self.calibration_sheet();
                 let doc = Document { sheet: &sheet, images: &[], pages: Pages::TestPage, calibration: self.settings.calibration, title: "Button Badger calibration" };
-                self.toast = Toast::result(print::print(&doc).map(|msg| format!("{msg}. Measure the two {rule} mm rules and enter them in the calibration card.")));
+                return print_task(&doc, format!(". Measure the two {rule} mm rules and enter them in the calibration card."));
             }
+            Message::Printed(result) => self.toast = Toast::result(result),
             Message::Reveal(path) => print::reveal(&path),
 
             Message::PresetName(s) => self.preset_name = s,
@@ -840,6 +861,12 @@ impl App {
                     if self.screenshot.as_ref().is_some_and(|(_, at)| now >= *at) {
                         return window::latest().and_then(window::screenshot).map(Message::Screenshot);
                     }
+                }
+            }
+            Message::SystemTheme(mode) => {
+                if self.settings.dark.is_none() {
+                    self.dark = mode == iced::theme::Mode::Dark;
+                    self.invalidate();
                 }
             }
             Message::ToggleDark => {
