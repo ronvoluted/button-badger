@@ -178,15 +178,24 @@ async fn portal_print(path: &std::path::Path, title: &str) -> Result<(), ashpd::
 
 /// Show a file in the OS file manager.
 pub fn reveal(path: &std::path::Path) {
-    let mut cmd = if cfg!(target_os = "macos") {
+    #[cfg(target_os = "macos")]
+    let mut cmd = {
         let mut c = std::process::Command::new("open");
         c.arg("-R").arg(path);
         c
-    } else if cfg!(windows) {
+    };
+    #[cfg(windows)]
+    let mut cmd = {
+        use std::os::windows::process::CommandExt;
+        // Explorer wants `/select,"C:\a b\c.pdf"`. `arg` would quote the whole thing as
+        // `"/select,C:\a b\c.pdf"` when the path has a space, which Explorer doesn't parse,
+        // so it opens Documents instead. Windows paths can't contain `"`, so this quoting is safe.
         let mut c = std::process::Command::new("explorer");
-        c.arg(format!("/select,{}", path.display()));
+        c.raw_arg(format!("/select,\"{}\"", path.display()));
         c
-    } else {
+    };
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let mut cmd = {
         let mut c = std::process::Command::new("xdg-open");
         c.arg(path.parent().unwrap_or(path));
         c
