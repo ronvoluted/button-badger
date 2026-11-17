@@ -1,6 +1,10 @@
 #![windows_subsystem = "windows"]
 //! Button Badger — print templates for button badges.
+//!
+//! This file is the app's state and wiring. `update` handles messages, `view` draws, and `fields` owns the
+//! numeric text fields; each adds its own `impl App`.
 
+mod fields;
 mod images;
 mod layout;
 mod pdf;
@@ -9,15 +13,15 @@ mod print;
 mod raster;
 mod settings;
 mod theme;
+mod update;
 mod view;
 
-use images::{Loaded, wrap_degrees};
-use layout::{Fit, LineStyle, Orientation, PRESETS, Packing, Paper, Sheet, TestPage, Units, trim_float};
-use pdf::{Document, Pages};
+use fields::Field;
+use images::Loaded;
+use layout::{Fit, LineStyle, Orientation, Packing, Paper, Sheet, TestPage, Units, trim_float};
 use preview::Interaction;
-use settings::{Preset, Settings};
+use settings::Settings;
 
-use iced::advanced::widget::{operate, operation::focusable::find_focused};
 use iced::widget::canvas::Cache;
 use iced::widget::image::Handle;
 use iced::{Event, Font, Size, Subscription, Task, Theme, Vector, event, keyboard, time, window};
@@ -42,63 +46,6 @@ fn main() -> iced::Result {
         })
         .centered()
         .run()
-}
-
-/// Show the system print dialog for `doc`. The toast is the status line plus `note`.
-fn print_task(doc: &Document, note: String) -> Task<Message> {
-    let done = move |r: Result<String, String>| Message::Printed(r.map(|msg| msg + &note));
-    // The macOS and Windows dialogs are modal and block; they have to run here, on the main thread.
-    #[cfg(any(target_os = "macos", windows))]
-    return Task::done(done(print::print(doc)));
-    #[cfg(not(any(target_os = "macos", windows)))]
-    Task::perform(print::print(doc.pdf(), doc.title.to_string()), done)
-}
-
-/// Every numeric text field. Each keeps its own text so half-typed values ("3.") survive.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-enum Field {
-    Face,
-    Bleed,
-    Gap,
-    Margin,
-    PaperW,
-    PaperH,
-    Weight,
-    MeasuredX,
-    MeasuredY,
-    Copies(usize),
-    Scale(usize),
-    Rotation(usize),
-}
-
-impl Field {
-    fn id(self) -> iced::widget::Id {
-        iced::widget::Id::from(format!("field-{self:?}"))
-    }
-
-    /// Step size in the field's display unit.
-    fn step(self, units: Units) -> f32 {
-        match self {
-            Field::Weight => 0.05,
-            Field::Copies(_) => 1.0,
-            Field::Scale(_) => 5.0,
-            Field::Rotation(_) => 90.0,
-            Field::MeasuredX | Field::MeasuredY => 0.5,
-            _ => match units {
-                Units::Mm => 0.5,
-                Units::Inch => 0.05,
-            },
-        }
-    }
-
-    fn decimals(self, units: Units) -> usize {
-        match self {
-            Field::Copies(_) | Field::Scale(_) | Field::Rotation(_) => 0,
-            Field::Weight => 2,
-            _ if units == Units::Inch => 3,
-            _ => 1,
-        }
-    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -344,10 +291,6 @@ impl App {
         }
     }
 
-    fn text(&self, f: Field) -> &str {
-        self.texts.get(&f).map(String::as_str).unwrap_or("")
-    }
-
     /// The sheet changed: re-composite every badge, re-layout and queue a save. This runs on every keystroke
     /// and drag tick, so the file is only written once the window loses focus or the app exits.
     fn sheet_changed(&mut self) {
@@ -385,31 +328,6 @@ impl App {
         self.guide_cache.clear();
     }
 
-    /// Reformat every sheet field from the model (after units, presets or sliders change it).
-    fn sync_texts(&mut self) {
-        let s = self.sheet();
-        let u = s.units;
-        let values = [
-            (Field::Face, u.format(s.face_mm)),
-            (Field::Bleed, u.format(s.bleed_mm)),
-            (Field::Gap, u.format(s.gap_mm)),
-            (Field::Margin, u.format(s.margin_mm)),
-            (Field::PaperW, u.format(s.custom_paper_mm.0)),
-            (Field::PaperH, u.format(s.custom_paper_mm.1)),
-            (Field::Weight, trim_float(s.guides.weight_pt, 2)),
-        ];
-        self.texts.extend(values);
-    }
-
-    fn sync_image_texts(&mut self) {
-        self.texts.retain(|f, _| !matches!(f, Field::Copies(_) | Field::Scale(_) | Field::Rotation(_)));
-        for (i, img) in self.images.iter().enumerate() {
-            self.texts.insert(Field::Copies(i), img.qty.to_string());
-            self.texts.insert(Field::Scale(i), trim_float(img.zoom * 100.0, 0));
-            self.texts.insert(Field::Rotation(i), trim_float(img.rotation, 0));
-        }
-    }
-
     /// Sheet used for the calibration test page: the calibration paper with the current orientation.
     fn calibration_sheet(&self) -> Sheet {
         Sheet { paper: self.settings.calibration_paper, ..self.sheet().clone() }
@@ -421,84 +339,6 @@ impl App {
         self.texts.insert(Field::MeasuredX, rule.clone());
         self.texts.insert(Field::MeasuredY, rule.clone());
         rule
-    }
-
-    /// Apply typed text to the model (copies, scale, rotation or a dimension).
-    fn apply_text(&mut self, field: Field, s: String) {
-        match field {
-            Field::Copies(i) => {
-                let digits: String = s.chars().filter(|c| c.is_ascii_digit()).take(4).collect();
-                if let Some(img) = self.images.get_mut(i) {
-                    img.qty = digits.parse().unwrap_or(0);
-                    self.texts.insert(field, digits);
-                    self.relayout();
-                }
-            }
-            Field::Scale(i) => {
-                let cleaned: String = s.chars().filter(|c| c.is_ascii_digit() || *c == '.').take(6).collect();
-                let parsed = cleaned.parse::<f32>();
-                self.texts.insert(field, cleaned);
-                if let (Ok(v), Some(img)) = (parsed, self.images.get_mut(i))
-                    && v.is_finite()
-                    && v >= 1.0
-                {
-                    img.zoom = (v / 100.0).clamp(0.05, 20.0);
-                    self.image_changed(i);
-                }
-            }
-            Field::Rotation(i) => {
-                let cleaned: String = s.chars().filter(|c| c.is_ascii_digit() || *c == '.' || *c == '-').take(7).collect();
-                if let (Ok(v), Some(img)) = (cleaned.parse::<f32>(), self.images.get_mut(i))
-                    && v.is_finite()
-                {
-                    img.rotation = wrap_degrees(v);
-                    // Show the wrapped angle once it differs (e.g. 270 → -90), but leave "-" or "4" alone mid-typing.
-                    let shown = if (img.rotation - v).abs() > 0.001 { trim_float(img.rotation, 0) } else { cleaned };
-                    self.texts.insert(field, shown);
-                    self.image_changed(i);
-                } else {
-                    self.texts.insert(field, cleaned);
-                }
-            }
-            Field::MeasuredX | Field::MeasuredY => {
-                // Only read when "Apply" is pressed.
-                self.texts.insert(field, s.chars().filter(|c| c.is_ascii_digit() || *c == '.' || *c == ',').take(8).collect());
-            }
-            _ => {
-                let cleaned: String = s.chars().filter(|c| c.is_ascii_digit() || *c == '.' || *c == ',').take(8).collect();
-                let parsed = parse_decimal(&cleaned);
-                self.texts.insert(field, cleaned);
-                if let Some(v) = parsed {
-                    let v = if field == Field::Weight { v } else { self.units().to_mm(v) };
-                    self.set_dimension(field, v);
-                    self.sheet_changed();
-                }
-            }
-        }
-    }
-
-    /// Nudge a numeric field by `dir` steps and re-apply it.
-    fn step_field(&mut self, field: Field, dir: f32) {
-        let current = parse_decimal(self.text(field)).unwrap_or(0.0);
-        let step = field.step(self.units());
-        let next = (current / step).round() * step + dir * step;
-        let next = if matches!(field, Field::Rotation(_)) { next } else { next.max(0.0) };
-        self.apply_text(field, trim_float(next, field.decimals(self.units())));
-    }
-
-    /// Set a sheet dimension, clamped to a sane range. Lengths in mm, weight in points.
-    fn set_dimension(&mut self, field: Field, v: f32) {
-        let s = &mut self.settings.sheet;
-        match field {
-            Field::Face => s.face_mm = v.clamp(5.0, 300.0),
-            Field::Bleed => s.bleed_mm = v.clamp(0.0, 50.0),
-            Field::Gap => s.gap_mm = v.clamp(0.0, 100.0),
-            Field::Margin => s.margin_mm = v.clamp(0.0, 100.0),
-            Field::PaperW => s.custom_paper_mm.0 = v.clamp(20.0, 2000.0),
-            Field::PaperH => s.custom_paper_mm.1 = v.clamp(20.0, 2000.0),
-            Field::Weight => s.guides.weight_pt = v.clamp(0.05, 5.0),
-            Field::MeasuredX | Field::MeasuredY | Field::Copies(_) | Field::Scale(_) | Field::Rotation(_) => {}
-        }
     }
 
     /// Replace the whole sheet (a preset or the defaults) and refresh everything that mirrors it.
@@ -514,426 +354,14 @@ impl App {
     }
 
     fn add_image(&mut self, path: PathBuf) -> Task<Message> {
+        self.load(path, Message::Loaded)
+    }
+
+    /// Decode `path` off the UI thread. `loading` counts the decodes in flight; `finish_load` counts them out.
+    fn load(&mut self, path: PathBuf, then: impl FnOnce(Result<Loaded, String>) -> Message + Send + 'static) -> Task<Message> {
         self.loading += 1;
-        Task::perform(async move { images::load(&path) }, Message::Loaded)
+        Task::perform(async move { images::load(&path) }, then)
     }
-
-    fn default_export_name(&self) -> String {
-        let base = self.images.first().map_or("badges", |i| i.name.as_str());
-        let s = self.sheet();
-        format!("{base} · {}mm badge · {}.pdf", trim_float(s.face_mm, 1), s.paper.to_string().trim_end_matches('…'))
-    }
-
-    // ---- update ----
-
-    fn update(&mut self, message: Message) -> Task<Message> {
-        match message {
-            Message::Open => {
-                let dlg = image_dialog("Choose images", self.settings.last_dir.clone());
-                return Task::perform(
-                    async move { dlg.pick_files().await.map(|fs| fs.iter().map(|f| f.path().to_path_buf()).collect()).unwrap_or_default() },
-                    Message::FilesPicked,
-                );
-            }
-            Message::FilesPicked(paths) => return Task::batch(paths.into_iter().map(|p| self.add_image(p))),
-            Message::DroppedFile(path) | Message::OpenRecent(path) => return self.add_image(path),
-            Message::Loaded(result) => {
-                self.loading = self.loading.saturating_sub(1);
-                match result {
-                    Ok(img) => {
-                        let saved = self.settings.remember(&img.path);
-                        self.saved(saved);
-                        self.badges.push(self.compose(&img));
-                        self.images.push(img);
-                        self.sync_image_texts();
-                        self.relayout();
-                    }
-                    Err(e) => self.toast = Toast::error(e),
-                }
-            }
-            Message::Replace(i) => {
-                let dlg = image_dialog("Replace image", self.settings.last_dir.clone());
-                return Task::perform(async move { dlg.pick_file().await.map(|f| f.path().to_path_buf()) }, move |p| Message::ReplaceWith(i, p));
-            }
-            Message::ReplaceWith(i, Some(path)) => {
-                self.loading += 1;
-                return Task::perform(async move { images::load(&path) }, move |r| Message::Replaced(i, r));
-            }
-            Message::ReplaceWith(_, None) => {}
-            Message::Replaced(i, result) => {
-                self.loading = self.loading.saturating_sub(1);
-                match result {
-                    Ok(mut img) => {
-                        if let Some(old) = self.images.get(i) {
-                            // Keep the placement and quantity; only the pixels change.
-                            img.qty = old.qty;
-                            img.zoom = old.zoom;
-                            img.offset_mm = old.offset_mm;
-                            img.rotation = old.rotation;
-                            let saved = self.settings.remember(&img.path);
-                            self.saved(saved);
-                            self.images[i] = img;
-                            self.image_changed(i);
-                        }
-                    }
-                    Err(e) => self.toast = Toast::error(e),
-                }
-            }
-            Message::Remove(i) => {
-                if i < self.images.len() {
-                    self.images.remove(i);
-                    self.badges.remove(i);
-                    self.sync_image_texts();
-                    self.relayout();
-                }
-            }
-            Message::ResetPlacement(i) => {
-                if let Some(img) = self.images.get_mut(i) {
-                    img.reset_placement();
-                    self.sync_image_texts();
-                    self.image_changed(i);
-                }
-            }
-
-            Message::Text(field, s) => self.apply_text(field, s),
-            Message::Slide(field, v) => {
-                self.set_dimension(field, v);
-                self.sync_texts();
-                self.sheet_changed();
-            }
-            Message::Step(field, dir) => self.step_field(field, dir),
-            Message::ArrowStep(dir) => {
-                // One pass over the widgets; yields nothing unless a widget with an id has focus.
-                return operate(find_focused()).map(move |id| Message::StepFocused(id, dir));
-            }
-            Message::StepFocused(id, dir) => {
-                // `texts` has an entry for every field on screen.
-                if let Some(&field) = self.texts.keys().find(|f| f.id() == id) {
-                    self.step_field(field, dir);
-                }
-            }
-
-            Message::BadgePreset(name) => {
-                if let Some(p) = PRESETS.iter().find(|p| p.name == name) {
-                    self.settings.sheet.face_mm = p.face_mm;
-                    self.settings.sheet.bleed_mm = p.bleed_mm;
-                    self.sync_texts();
-                    self.sheet_changed();
-                }
-            }
-            Message::Paper(p) => {
-                self.settings.sheet.paper = p;
-                self.settings.calibration_paper = p;
-                self.zoom = None;
-                self.sheet_changed();
-            }
-            Message::Orientation(o) => {
-                self.settings.sheet.orientation = o;
-                self.zoom = None;
-                self.sheet_changed();
-            }
-            Message::Packing(p) => {
-                self.settings.sheet.packing = p;
-                self.sheet_changed();
-            }
-            Message::Units(u) => {
-                self.settings.sheet.units = u;
-                self.sync_texts();
-                self.sheet_changed();
-            }
-            Message::CutStyle(s) => {
-                self.settings.sheet.guides.cut = s;
-                self.sheet_changed();
-            }
-            Message::Fit(f) => {
-                self.settings.sheet.fit = f;
-                self.sheet_changed();
-            }
-            Message::Toggle(t, v) => {
-                let g = &mut self.settings.sheet.guides;
-                match t {
-                    Toggle::FaceLine => g.face = v,
-                    Toggle::CropMarks => g.crop_marks = v,
-                    Toggle::Clip => g.clip = v,
-                }
-                self.sheet_changed();
-            }
-            Message::Background(bg) => {
-                self.bg_mode = bg;
-                self.settings.sheet.background = match bg {
-                    Bg::None => None,
-                    Bg::White => Some([1.0; 3]),
-                    Bg::Custom => parse_hex(&self.bg_hex).or(parse_hex(DEFAULT_CUSTOM_BG)),
-                };
-                self.sheet_changed();
-            }
-            Message::BgSwatch(rgb) => {
-                self.bg_hex = hex_of(rgb);
-                self.bg_mode = Bg::Custom;
-                self.settings.sheet.background = Some(rgb);
-                self.sheet_changed();
-            }
-            Message::BgHex(s) => {
-                let digits: String = s.chars().filter(char::is_ascii_hexdigit).take(6).collect();
-                self.bg_hex = format!("#{digits}");
-                if let Some(rgb) = parse_hex(&self.bg_hex)
-                    && self.bg_mode == Bg::Custom
-                {
-                    self.settings.sheet.background = Some(rgb);
-                    self.sheet_changed();
-                }
-            }
-
-            Message::Preview(interaction) => match interaction {
-                Interaction::Zoom(z, pan) => {
-                    self.zoom = Some(z);
-                    self.pan = pan;
-                    self.invalidate();
-                }
-                Interaction::Pan(p) => {
-                    self.pan = p;
-                    self.invalidate();
-                }
-                Interaction::Hover(cell) => self.hover = cell,
-                Interaction::DragEnd => self.dragging = None,
-                Interaction::ImageOffset(i, off) => {
-                    if let Some(img) = self.images.get_mut(i) {
-                        img.offset_mm = off;
-                        self.dragging = Some(i);
-                        self.image_changed(i);
-                    }
-                }
-                Interaction::ImageZoom(i, z) | Interaction::ScaleDrag(i, z) => {
-                    if let Some(img) = self.images.get_mut(i) {
-                        img.zoom = z;
-                        if matches!(interaction, Interaction::ScaleDrag(..)) {
-                            self.dragging = Some(i);
-                        }
-                        self.sync_image_texts();
-                        self.image_changed(i);
-                    }
-                }
-                Interaction::RotateDrag(i, deg) => {
-                    if let Some(img) = self.images.get_mut(i) {
-                        img.rotation = deg;
-                        self.dragging = Some(i);
-                        self.texts.insert(Field::Rotation(i), trim_float(deg, 0));
-                        self.image_changed(i);
-                    }
-                }
-            },
-            Message::ZoomBy(factor) => {
-                // About the canvas centre; 3 px/mm stands in for "fit" when no zoom is set yet.
-                self.zoom = Some((self.zoom.unwrap_or(3.0) * factor).clamp(0.2, 60.0));
-                self.pan *= factor;
-                self.invalidate();
-            }
-            Message::ZoomFit => {
-                self.zoom = None;
-                self.pan = Vector::ZERO;
-                self.invalidate();
-            }
-            Message::Page(d) => {
-                let last = self.pages.len() as isize - 1;
-                self.page = (self.page as isize + d).clamp(0, last) as usize;
-                self.cache.clear();
-            }
-
-            Message::Export => {
-                if self.images.is_empty() {
-                    self.toast = Toast::error("Add an image first");
-                    return Task::none();
-                }
-                let dir = self.settings.last_dir.clone().or_else(|| std::env::home_dir().map(|h| h.join("Desktop")));
-                let dlg = file_dialog("Export PDF", dir).set_file_name(self.default_export_name()).add_filter("PDF", &["pdf"]);
-                return Task::perform(async move { dlg.save_file().await.map(|f| f.path().to_path_buf()) }, Message::ExportTo);
-            }
-            Message::ExportTo(Some(path)) => {
-                // Images hold their pixels in `Arc`s, so these clones are cheap.
-                let (sheet, images, pages, calibration) = (self.sheet().clone(), self.images.clone(), self.pages.clone(), self.settings.calibration);
-                return Task::perform(
-                    async move {
-                        let doc = Document { sheet: &sheet, images: &images, pages: Pages::Badges(&pages), calibration, title: "Button Badger" };
-                        std::fs::write(&path, doc.pdf()).map(|_| path).map_err(|e| e.to_string())
-                    },
-                    Message::Exported,
-                );
-            }
-            Message::ExportTo(None) => {}
-            Message::Exported(Ok(path)) => {
-                let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-                self.toast = Toast::info(format!("Saved {name}"));
-                if let Some(t) = &mut self.toast {
-                    t.path = Some(path);
-                }
-            }
-            Message::Exported(Err(e)) => self.toast = Toast::error(format!("Couldn't save: {e}")),
-            Message::Print => {
-                if self.images.is_empty() {
-                    self.toast = Toast::error("Add an image first");
-                    return Task::none();
-                }
-                let doc = Document { sheet: self.sheet(), images: &self.images, pages: Pages::Badges(&self.pages), calibration: self.settings.calibration, title: "Button Badger" };
-                return print_task(&doc, String::new());
-            }
-            Message::PrintTest => {
-                let rule = self.reset_measured();
-                let sheet = self.calibration_sheet();
-                let doc = Document { sheet: &sheet, images: &[], pages: Pages::TestPage, calibration: self.settings.calibration, title: "Button Badger calibration" };
-                return print_task(&doc, format!(". Measure the two {rule} mm rules and enter them in the calibration card."));
-            }
-            Message::Printed(result) => self.toast = Toast::result(result),
-            Message::Reveal(path) => print::reveal(&path),
-
-            Message::PresetName(s) => self.preset_name = s,
-            Message::SavePreset => {
-                let name = self.preset_name.trim().to_string();
-                if name.is_empty() {
-                    return Task::none();
-                }
-                let presets = &mut self.settings.presets;
-                presets.retain(|p| p.name != name);
-                presets.push(Preset { name: name.clone(), sheet: self.settings.sheet.clone() });
-                presets.sort_by(|a, b| a.name.cmp(&b.name));
-                self.toast = Toast::info(format!("Setup “{name}” saved"));
-                self.selected_preset = Some(name);
-                self.preset_name.clear();
-                self.saved(self.settings.save());
-            }
-            Message::LoadPreset(name) => {
-                if let Some(p) = self.settings.presets.iter().find(|p| p.name == name) {
-                    self.set_sheet(p.sheet.clone());
-                    self.selected_preset = Some(name);
-                }
-            }
-            Message::DeletePreset => {
-                if let Some(name) = &self.selected_preset {
-                    return confirm("Delete this setup?", format!("“{name}” will be removed. This can't be undone."), "Delete", Message::DeletePresetConfirmed);
-                }
-            }
-            Message::DeletePresetConfirmed(yes) => {
-                if yes && let Some(name) = self.selected_preset.take() {
-                    self.settings.presets.retain(|p| p.name != name);
-                    self.toast = Toast::info(format!("Deleted “{name}”"));
-                    self.saved(self.settings.save());
-                }
-            }
-            Message::ResetDefaults => {
-                return confirm(
-                    "Reset to defaults?",
-                    "Badge, paper and guide settings go back to their defaults. Your images, saved setups and printer calibration are kept.".into(),
-                    "Reset",
-                    Message::ResetDefaultsConfirmed,
-                );
-            }
-            Message::ResetDefaultsConfirmed(yes) => {
-                if yes {
-                    self.set_sheet(Sheet::default());
-                    self.settings.calibration_paper = self.sheet().paper;
-                    self.reset_measured();
-                    self.selected_preset = None;
-                    self.pan = Vector::ZERO;
-                    self.toast = Toast::info("Settings reset to defaults");
-                }
-            }
-            Message::CalibrationPaper(p) => {
-                self.settings.calibration_paper = p;
-                self.reset_measured();
-                self.saved(self.settings.save());
-            }
-            Message::ApplyCalibration => {
-                let rule = TestPage::new(&self.calibration_sheet()).rule;
-                // Reject typos: a real printer is never off by 50%.
-                let measured = |f| parse_decimal(self.text(f)).filter(|v| (rule * 0.5..=rule * 1.5).contains(v));
-                match (measured(Field::MeasuredX), measured(Field::MeasuredY)) {
-                    (Some(x), Some(y)) => {
-                        self.settings.calibration = (rule / x, rule / y);
-                        self.toast = Toast::info(format!("Calibrated: ×{:.4} across, ×{:.4} down", rule / x, rule / y));
-                        self.saved(self.settings.save());
-                    }
-                    _ => self.toast = Toast::error(format!("Enter the measured lengths of the {} mm rules, in mm", trim_float(rule, 0))),
-                }
-            }
-            Message::ResetCalibration => {
-                self.settings.calibration = (1.0, 1.0);
-                self.reset_measured();
-                self.saved(self.settings.save());
-            }
-
-            Message::FocusLost => self.saved(settings::flush()),
-            Message::DismissToast => self.toast = None,
-            Message::Tick(now) => {
-                if self.toast.as_ref().is_some_and(|t| now >= t.until) {
-                    self.toast = None;
-                }
-                #[cfg(debug_assertions)]
-                {
-                    if self.screenshot.as_ref().is_some_and(|(_, at)| now >= *at) {
-                        return window::latest().and_then(window::screenshot).map(Message::Screenshot);
-                    }
-                }
-            }
-            Message::SystemTheme(mode) => {
-                if self.settings.dark.is_none() {
-                    self.dark = mode == iced::theme::Mode::Dark;
-                    self.invalidate();
-                }
-            }
-            Message::ToggleDark => {
-                self.dark = !self.dark;
-                self.settings.dark = Some(self.dark);
-                self.saved(self.settings.save());
-                self.invalidate();
-            }
-            #[cfg(debug_assertions)]
-            Message::Screenshot(shot) => {
-                if let Some((path, _)) = self.screenshot.take() {
-                    let _ = image::save_buffer(&path, &shot.rgba, shot.size.width, shot.size.height, image::ColorType::Rgba8);
-                    return iced::exit();
-                }
-            }
-        }
-        Task::none()
-    }
-}
-
-fn file_dialog(title: &str, dir: Option<PathBuf>) -> rfd::AsyncFileDialog {
-    let dlg = rfd::AsyncFileDialog::new().set_title(title);
-    match dir {
-        Some(d) => dlg.set_directory(d),
-        None => dlg,
-    }
-}
-
-/// Open dialog limited to supported images. Windows and Linux list filters in a dropdown, so "All files" is
-/// offered there; macOS (rfd) merges every filter into one allowed-types list, where it would cancel the filtering.
-fn image_dialog(title: &str, dir: Option<PathBuf>) -> rfd::AsyncFileDialog {
-    let dlg = file_dialog(title, dir).add_filter("Images", images::EXTENSIONS);
-    if cfg!(target_os = "macos") { dlg } else { dlg.add_filter("All files", &["*"]) }
-}
-
-/// Ask in a native dialog; `then` receives whether `action` (vs Cancel) was chosen.
-fn confirm(title: &str, description: String, action: &'static str, then: fn(bool) -> Message) -> Task<Message> {
-    let dialog = rfd::AsyncMessageDialog::new()
-        .set_level(rfd::MessageLevel::Warning)
-        .set_title(title)
-        .set_description(description)
-        .set_buttons(rfd::MessageButtons::OkCancelCustom(action.into(), "Cancel".into()));
-    Task::perform(
-        async move {
-            match dialog.show().await {
-                rfd::MessageDialogResult::Ok => true,
-                rfd::MessageDialogResult::Custom(s) => s == action,
-                _ => false,
-            }
-        },
-        then,
-    )
-}
-
-/// Parse a number typed with either decimal separator.
-fn parse_decimal(s: &str) -> Option<f32> {
-    s.replace(',', ".").parse::<f32>().ok().filter(|v| v.is_finite())
 }
 
 fn bg_mode_of(bg: Option<[f32; 3]>) -> Bg {
@@ -963,13 +391,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn hex_round_trip_and_decimals() {
+    fn hex_round_trip() {
         assert_eq!(parse_hex("#F4E7D3").map(hex_of).as_deref(), Some("#F4E7D3"));
         assert_eq!(parse_hex("#F4E7"), None);
-        assert_eq!(parse_decimal("2,5"), Some(2.5));
-        assert_eq!(parse_decimal("."), None);
-        // Arrow-key stepping finds the focused field by comparing ids.
-        assert_eq!(Field::Copies(2).id(), Field::Copies(2).id());
-        assert_ne!(Field::Copies(2).id(), Field::Copies(1).id());
     }
 }
