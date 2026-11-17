@@ -4,6 +4,7 @@ version = "0.2.4"
 edition = "2024"
 rust-version = "1.99"
 description = "Auto-align images for printing as button/badge template cutouts"
+license = "MIT"
 
 [dependencies]
 # "image-without-codecs", not "image": the latter turns on every `image` codec, including an AV1 encoder.
