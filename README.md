@@ -1,7 +1,7 @@
 # Button Badger
 
 <p align="center">
-  <img src="packaging/icon.svg" width="200" alt="Button Badger icon]">
+  <img src="packaging/icon.svg" width="200" alt="Button Badger icon">
 </p>
 
 Aligns images for printing button/badge templates to cut out in various configurations, with handy scissor lines and printer-scaling calibration. Vibe coded after having to edit and arrange things manually for the umpteenth time.
