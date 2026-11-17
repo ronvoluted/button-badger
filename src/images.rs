@@ -244,8 +244,9 @@ mod tests {
 
     #[test]
     fn rotating_90_matches_rotated_pixels() {
-        // A wide, two-tone image: rotating the placement must look like rotating the pixels.
-        let src = RgbaImage::from_fn(60, 30, |x, _| if x < 20 { Rgba([255, 0, 0, 255]) } else { Rgba([0, 0, 255, 255]) });
+        // Rotating the placement must look like rotating the pixels. The image is wide and lopsided both ways,
+        // so a turn the wrong way, a flip or a shift of one pixel would each show.
+        let src = RgbaImage::from_fn(60, 30, |x, y| Rgba(if x < 20 { [255, 0, 0, 255] } else if y < 10 { [0, 255, 0, 255] } else { [0, 0, 255, 255] }));
         let img = |pixels: RgbaImage, rotation| Loaded {
             path: PathBuf::new(),
             name: String::new(),
@@ -262,7 +263,7 @@ mod tests {
         let a = img(src.clone(), 90.0);
         let b = img(imageops::rotate90(&src), 0.0);
         let (ra, rb) = (compose(&sheet, &a, &a.full, 100), compose(&sheet, &b, &b.full, 100));
-        let differing = ra.pixels().zip(rb.pixels()).filter(|(p, q)| (0..4).any(|k| p[k].abs_diff(q[k]) > 40)).count();
-        assert!(differing < 300, "{differing} of 10000 pixels differ"); // only edge pixels may disagree
+        let worst = ra.pixels().zip(rb.pixels()).flat_map(|(p, q)| (0..4).map(move |k| p[k].abs_diff(q[k]))).max().unwrap();
+        assert!(worst <= 1, "a pixel differs by {worst}/255"); // only rounding may disagree
     }
 }
