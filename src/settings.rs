@@ -3,7 +3,7 @@
 use crate::layout::{Paper, Sheet};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
-use std::sync::{Mutex, Once};
+use std::time::{Duration, Instant};
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct Preset {
@@ -24,6 +24,9 @@ pub struct Settings {
     /// None = follow the system appearance.
     pub dark: Option<bool>,
     pub last_dir: Option<PathBuf>,
+    /// When the edits queued by `save_later` are due to be written. `None`: nothing is waiting.
+    #[serde(skip)]
+    due: Option<Instant>,
 }
 
 impl Default for Settings {
@@ -36,12 +39,13 @@ impl Default for Settings {
             calibration_paper: Paper::A4,
             dark: None,
             last_dir: None,
+            due: None,
         }
     }
 }
 
-/// Settings queued by `save_later`, waiting for `flush`.
-static PENDING: Mutex<Option<Settings>> = Mutex::new(None);
+/// How long after the last queued edit the file is written.
+const SAVE_DELAY: Duration = Duration::from_millis(500);
 
 fn path() -> PathBuf {
     if cfg!(test) {
@@ -83,8 +87,8 @@ impl Settings {
         (Settings::default(), Some(warning))
     }
 
-    pub fn save(&self) -> Result<(), String> {
-        PENDING.lock().unwrap().take(); // this write supersedes anything queued
+    pub fn save(&mut self) -> Result<(), String> {
+        self.due = None; // this write covers anything queued
         let p = path();
         let write = || -> std::io::Result<()> {
             if let Some(dir) = p.parent() {
@@ -92,21 +96,30 @@ impl Settings {
             }
             // Written beside the file, then renamed over it, so a crash mid-write can't leave half a file.
             let tmp = p.with_extension("json.tmp");
-            std::fs::write(&tmp, serde_json::to_vec_pretty(self)?)?;
+            std::fs::write(&tmp, serde_json::to_vec_pretty(&*self)?)?;
             std::fs::rename(tmp, &p)
         };
         write().map_err(|e| format!("Couldn't save your settings: {e}"))
     }
 
-    /// Queue a save for the next `flush` (the window losing focus) or for exit, whichever comes first.
-    /// For edits that arrive on every keystroke or drag tick.
-    pub fn save_later(&self) {
-        // Quitting (⌘Q on macOS) ends the process without iced hearing of it, so exit is caught by the C runtime.
-        static AT_EXIT: Once = Once::new();
-        AT_EXIT.call_once(|| unsafe {
-            libc::atexit(flush_at_exit);
-        });
-        *PENDING.lock().unwrap() = Some(self.clone());
+    /// Queue a save for `flush` to write once the edits pause. For edits that arrive on every keystroke or
+    /// drag tick. Quitting (⌘Q on macOS) ends the process without iced hearing of it, so an edit made in the
+    /// last moment before a quit is not written.
+    pub fn save_later(&mut self) {
+        self.due = Some(Instant::now() + SAVE_DELAY);
+    }
+
+    /// Whether a queued save is waiting for `flush`.
+    pub fn queued(&self) -> bool {
+        self.due.is_some()
+    }
+
+    /// Write a queued save once it is due at `now`. `None` writes it whatever the time (the window lost focus).
+    pub fn flush(&mut self, now: Option<Instant>) -> Result<(), String> {
+        match self.due {
+            Some(due) if now.is_none_or(|now| now >= due) => self.save(),
+            _ => Ok(()),
+        }
     }
 
     /// Record a successfully opened file in the recent list and save.
@@ -119,39 +132,33 @@ impl Settings {
     }
 }
 
-/// Write the settings queued by `save_later`, if any.
-pub fn flush() -> Result<(), String> {
-    let pending = PENDING.lock().unwrap().take();
-    pending.map_or(Ok(()), |s| s.save())
-}
-
-extern "C" fn flush_at_exit() {
-    // Too late for a toast.
-    if let Err(e) = flush() {
-        eprintln!("{e}");
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn saves_on_flush_and_never_loses_a_file() {
+    fn saves_when_due_and_never_loses_a_file() {
         // One test, because every step shares the settings file.
         let _ = std::fs::remove_file(path());
-        Settings { calibration: (1.5, 1.5), ..Settings::default() }.save_later();
-        assert!(!path().exists(), "nothing written until flush");
-        flush().unwrap();
+        let mut queued = Settings { calibration: (1.5, 1.5), ..Settings::default() };
+        queued.save_later();
+        let now = Instant::now();
+        queued.flush(Some(now)).unwrap();
+        assert!(!path().exists(), "nothing written until the edits pause");
+        queued.flush(Some(now + SAVE_DELAY)).unwrap();
         assert_eq!(Settings::load().0.calibration, (1.5, 1.5));
         std::fs::remove_file(path()).unwrap();
-        flush().unwrap();
+        queued.flush(None).unwrap();
         assert!(!path().exists(), "nothing left to write");
         assert!(Settings::load().1.is_none(), "no file yet is not an error");
+        // Losing focus writes a queued save without waiting.
+        queued.save_later();
+        queued.flush(None).unwrap();
+        assert!(path().exists() && !queued.queued());
 
         // A file that doesn't parse is set aside, where the next save can't overwrite it.
         std::fs::write(path(), "{ not json").unwrap();
-        let (settings, warning) = Settings::load();
+        let (mut settings, warning) = Settings::load();
         let kept = warning.expect("the user is told").1;
         assert_eq!(settings.calibration, (1.0, 1.0));
         settings.save().unwrap();

@@ -5,7 +5,7 @@ use crate::images::{self, Loaded};
 use crate::layout::{PRESETS, Sheet, TestPage, trim_float};
 use crate::pdf::{Document, Pages};
 use crate::preview::Interaction;
-use crate::settings::{self, Preset};
+use crate::settings::Preset;
 use crate::{App, Bg, DEFAULT_CUSTOM_BG, Message, SheetEdit, Toast, Toggle, hex_of, parse_hex, print};
 use iced::advanced::widget::{operate, operation::focusable::find_focused};
 use iced::{Task, Vector};
@@ -169,7 +169,7 @@ impl App {
                 self.toast = Toast::info(format!("Setup “{name}” saved"));
                 self.selected_preset = Some(name);
                 self.preset_name.clear();
-                self.saved(self.settings.save());
+                self.save();
             }
             Message::LoadPreset(name) => {
                 if let Some(p) = self.settings.presets.iter().find(|p| p.name == name) {
@@ -186,7 +186,7 @@ impl App {
                 if yes && let Some(name) = self.selected_preset.take() {
                     self.settings.presets.retain(|p| p.name != name);
                     self.toast = Toast::info(format!("Deleted “{name}”"));
-                    self.saved(self.settings.save());
+                    self.save();
                 }
             }
             Message::ResetDefaults => {
@@ -210,7 +210,7 @@ impl App {
             Message::CalibrationPaper(p) => {
                 self.settings.calibration_paper = p;
                 self.reset_measured();
-                self.saved(self.settings.save());
+                self.save();
             }
             Message::ApplyCalibration => {
                 let rule = TestPage::new(&self.calibration_sheet()).rule;
@@ -220,7 +220,7 @@ impl App {
                     (Some(x), Some(y)) => {
                         self.settings.calibration = (rule / x, rule / y);
                         self.toast = Toast::info(format!("Calibrated: ×{:.4} across, ×{:.4} down", rule / x, rule / y));
-                        self.saved(self.settings.save());
+                        self.save();
                     }
                     _ => self.toast = Toast::error(format!("Enter the measured lengths of the {} mm rules, in mm", trim_float(rule, 0))),
                 }
@@ -228,16 +228,17 @@ impl App {
             Message::ResetCalibration => {
                 self.settings.calibration = (1.0, 1.0);
                 self.reset_measured();
-                self.saved(self.settings.save());
+                self.save();
             }
 
             // Misc
-            Message::FocusLost => self.saved(settings::flush()),
+            Message::FocusLost => self.flush(None),
             Message::DismissToast => self.toast = None,
             Message::Tick(now) => {
                 if self.toast.as_ref().is_some_and(|t| now >= t.until) {
                     self.toast = None;
                 }
+                self.flush(Some(now));
                 #[cfg(debug_assertions)]
                 {
                     if self.screenshot.as_ref().is_some_and(|(_, at)| now >= *at) {
@@ -254,7 +255,7 @@ impl App {
             Message::ToggleDark => {
                 self.dark = !self.dark;
                 self.settings.dark = Some(self.dark);
-                self.saved(self.settings.save());
+                self.save();
                 self.invalidate();
             }
             #[cfg(debug_assertions)]

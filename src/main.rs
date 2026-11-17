@@ -271,7 +271,7 @@ impl App {
         if self.settings.dark.is_none() {
             subs.push(iced::system::theme_changes().map(Message::SystemTheme));
         }
-        let ticking = self.toast.is_some();
+        let ticking = self.toast.is_some() || self.settings.queued();
         #[cfg(debug_assertions)]
         let ticking = ticking || self.screenshot.is_some();
         if ticking {
@@ -297,8 +297,20 @@ impl App {
         }
     }
 
+    /// Write the settings now.
+    fn save(&mut self) {
+        let result = self.settings.save();
+        self.saved(result);
+    }
+
+    /// Write queued settings once they are due at `now`; `None` writes them whatever the time.
+    fn flush(&mut self, now: Option<Instant>) {
+        let result = self.settings.flush(now);
+        self.saved(result);
+    }
+
     /// The sheet changed: re-composite every badge, re-layout and queue a save. This runs on every keystroke
-    /// and drag tick, so the file is only written once the window loses focus or the app exits.
+    /// and drag tick, so the file is only written once the edits pause or the window loses focus.
     fn sheet_changed(&mut self) {
         self.badges = self.images.iter().map(|img| self.compose(img)).collect();
         self.relayout();
