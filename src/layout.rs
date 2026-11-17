@@ -412,19 +412,34 @@ struct Grid {
 impl Grid {
     fn new(cells: &[(f32, f32)]) -> Grid {
         let mut rc = Vec::with_capacity(cells.len());
-        let (mut r, mut c) = (0, 0);
+        // Where each row starts, then the total: row `r` is `cells[rows[r]..rows[r + 1]]`.
+        let mut rows = vec![0];
         for (k, cell) in cells.iter().enumerate() {
             if k > 0 && (cell.1 - cells[k - 1].1).abs() > 1e-3 {
-                (r, c) = (r + 1, 0);
+                rows.push(k);
             }
-            rc.push((r, c));
-            c += 1;
+            rc.push((rows.len() - 1, k - rows[rows.len() - 1]));
         }
-        // Touching cells are one pitch apart, the closest any two cells get.
+        rows.push(cells.len());
+        let (rows, rc_of) = (&rows, &rc);
         let dist = |a: usize, b: usize| (cells[a].0 - cells[b].0).hypot(cells[a].1 - cells[b].1);
+        // Cells within `reach` of cell `a`. Only its own row and the rows above and below are searched: rows are
+        // evenly spaced, so anything further away is further than a neighbour. Each row runs left to right, so
+        // it is a binary search, where comparing every pair of cells froze the app on a page of 100,000+.
+        let near = |a: usize, reach: f32| {
+            let (r, x) = (rc_of[a].0, cells[a].0);
+            (r.saturating_sub(1)..(r + 2).min(rows.len() - 1))
+                .flat_map(move |r| {
+                    let from = rows[r] + cells[rows[r]..rows[r + 1]].partition_point(|c| c.0 < x - reach);
+                    (from..rows[r + 1]).take_while(move |&b| cells[b].0 <= x + reach)
+                })
+                .filter(move |&b| b != a && dist(a, b) <= reach)
+        };
+        // Touching cells are one pitch apart, the closest any two cells get (so no further than the first two).
         let n = cells.len();
-        let pitch = (0..n).flat_map(|a| (a + 1..n).map(move |b| (a, b))).map(|(a, b)| dist(a, b)).fold(f32::INFINITY, f32::min);
-        let neighbours = (0..n).map(|a| (0..n).filter(|&b| b != a && dist(a, b) < pitch * 1.05).collect()).collect();
+        let first = if n > 1 { dist(0, 1) } else { 0.0 };
+        let pitch = (0..n).flat_map(|a| near(a, first).map(move |b| dist(a, b))).fold(f32::INFINITY, f32::min);
+        let neighbours = (0..n).map(|a| near(a, pitch * 1.05).collect()).collect();
         Grid { rc, neighbours }
     }
 
@@ -444,20 +459,22 @@ impl Grid {
         groups.sort();
         groups.dedup();
         let (mut broken, mut gaps) = (0, 0);
+        let mut seen = vec![false; page.len()];
         for g in groups {
             let members: Vec<usize> = (0..page.len()).filter(|&k| page[k] == g).collect();
             // Flood fill from the first member; anything not reached means the group is split.
-            let mut seen = vec![members[0]];
-            let mut i = 0;
-            while i < seen.len() {
-                for &b in &self.neighbours[seen[i]] {
-                    if page[b] == g && !seen.contains(&b) {
-                        seen.push(b);
+            let (mut todo, mut reached) = (vec![members[0]], 0);
+            seen[members[0]] = true;
+            while let Some(a) = todo.pop() {
+                reached += 1;
+                for &b in &self.neighbours[a] {
+                    if page[b] == g && !seen[b] {
+                        seen[b] = true;
+                        todo.push(b);
                     }
                 }
-                i += 1;
             }
-            broken += usize::from(seen.len() < members.len());
+            broken += usize::from(reached < members.len());
             let span = |f: fn(&(usize, usize)) -> usize| {
                 let v = members.iter().map(|&k| f(&self.rc[k]));
                 v.clone().max().unwrap_or(0) - v.min().unwrap_or(0) + 1
@@ -583,6 +600,32 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn neighbours_match_every_pair_and_scale() {
+        // The row search finds exactly the cells a comparison of every pair does.
+        let narrow = Sheet { paper: Paper::Custom, custom_paper_mm: (50.0, 200.0), ..Sheet::default() };
+        for packing in [Packing::Grid, Packing::Hex] {
+            for base in [Sheet::default(), Sheet { orientation: Orientation::Landscape, gap_mm: 0.0, ..Sheet::default() }, narrow.clone()] {
+                let cells = Sheet { packing, ..base }.cells();
+                let dist = |a: usize, b: usize| (cells[a].0 - cells[b].0).hypot(cells[a].1 - cells[b].1);
+                let n = cells.len();
+                let pitch = (0..n).flat_map(|a| (a + 1..n).map(move |b| (a, b))).map(|(a, b)| dist(a, b)).fold(f32::INFINITY, f32::min);
+                for (a, mut found) in Grid::new(&cells).neighbours.into_iter().enumerate() {
+                    found.sort();
+                    let all: Vec<usize> = (0..n).filter(|&b| b != a && dist(a, b) < pitch * 1.05).collect();
+                    assert_eq!(found, all, "{packing:?}, cell {a} of {n}");
+                }
+            }
+        }
+        // The most cells the UI allows on a page: the smallest badge on the largest custom paper. Comparing
+        // every pair here took tens of billions of steps per keystroke.
+        let huge = Sheet { paper: Paper::Custom, custom_paper_mm: (2000.0, 2000.0), face_mm: 5.0, bleed_mm: 0.0, gap_mm: 0.0, margin_mm: 0.0, ..Sheet::default() };
+        let cells = huge.cells();
+        assert!(cells.len() >= 160_000);
+        let pages = paginate(&cells, &[3, 0, 0]);
+        assert_eq!(pages[0].iter().flatten().count(), cells.len());
     }
 
     #[test]
