@@ -154,9 +154,8 @@ impl Document<'_> {
         ];
         c.set_fill_gray(0.0);
         for (cx, y, size, text) in lines {
-            let bytes = win_ansi(&text);
-            // Centre using Helvetica's average advance (~0.5 em).
-            let x = cx - bytes.len() as f32 * size * 0.25;
+            let (bytes, em) = helvetica(&text);
+            let x = cx - em * size / 2.0;
             c.begin_text();
             c.set_font(Name(b"F1"), size);
             c.set_text_matrix([1.0, 0.0, 0.0, -1.0, x, y]);
@@ -170,20 +169,39 @@ fn xobject_name(image: usize) -> String {
     format!("Im{image}")
 }
 
-/// Encode text for the built-in Helvetica font (WinAnsi); unknown characters become '?'.
-fn win_ansi(text: &str) -> Vec<u8> {
-    text.chars()
-        .map(|ch| match ch {
-            '·' => 0xB7,
-            'Ø' => 0xD8,
-            '×' => 0xD7,
-            '°' => 0xB0,
-            '“' => 0x93,
-            '”' => 0x94,
-            c if c.is_ascii() => c as u8,
-            _ => b'?',
+/// Advance widths of Helvetica's printable ASCII (codes 32 to 126) in 1/1000 em, from Adobe's Helvetica.afm.
+#[rustfmt::skip]
+const HELVETICA_ASCII: [u16; 95] = [
+    278, 278, 355, 556, 556, 889, 667, 191, 333, 333, 389, 584, 278, 333, 278, 278,
+    556, 556, 556, 556, 556, 556, 556, 556, 556, 556, 278, 278, 584, 584, 584, 556,
+    1015, 667, 667, 722, 722, 667, 611, 778, 722, 278, 500, 667, 556, 833, 722, 778,
+    667, 778, 722, 667, 611, 722, 667, 944, 667, 667, 611, 278, 278, 278, 469, 556,
+    333, 556, 556, 500, 556, 556, 278, 556, 556, 222, 222, 500, 222, 833, 556, 556,
+    556, 556, 333, 500, 278, 556, 500, 722, 500, 500, 500, 334, 260, 334, 584,
+];
+
+/// The other characters the labels use: (character, WinAnsi code, Helvetica advance in 1/1000 em).
+const HELVETICA_EXTRA: [(char, u8, u16); 6] = [('·', 0xB7, 278), ('Ø', 0xD8, 778), ('×', 0xD7, 584), ('°', 0xB0, 400), ('“', 0x93, 333), ('”', 0x94, 333)];
+
+/// Encode text for the built-in Helvetica font (WinAnsi) and measure it: (bytes, width in ems).
+/// Characters outside the two tables become '?'.
+fn helvetica(text: &str) -> (Vec<u8>, f32) {
+    let mut width = 0;
+    let bytes = text
+        .chars()
+        .map(|ch| {
+            let (byte, advance) = match HELVETICA_EXTRA.iter().find(|e| e.0 == ch) {
+                Some(&(_, byte, advance)) => (byte, advance),
+                None => {
+                    let byte = if (' '..='~').contains(&ch) { ch as u8 } else { b'?' };
+                    (byte, HELVETICA_ASCII[byte as usize - 32])
+                }
+            };
+            width += advance as u32;
+            byte
         })
-        .collect()
+        .collect();
+    (bytes, width as f32 / 1000.0)
 }
 
 /// Write `img` as an XObject filling the unit square and return its id.
@@ -311,6 +329,14 @@ pub(crate) mod tests {
             offset_mm: (0.0, 0.0),
             rotation: 0.0,
         }
+    }
+
+    #[test]
+    fn labels_are_measured_with_helvetica_advances() {
+        // From Helvetica.afm: digits 556, space 278, m 833, a 556, c 500, r 333, o 556, s 500.
+        assert_eq!(helvetica("100 mm across"), (b"100 mm across".to_vec(), 6.835));
+        assert_eq!(helvetica("Ø·"), (vec![0xD8, 0xB7], 1.056));
+        assert_eq!(helvetica("é").0, b"?");
     }
 
     #[test]
