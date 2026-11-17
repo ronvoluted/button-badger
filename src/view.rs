@@ -3,7 +3,11 @@
 use crate::layout::{Fit, LineStyle, Orientation, PRESETS, Packing, Paper, TestPage, Units, trim_float};
 use crate::preview::{Guides, Preview, Viewport};
 use crate::theme::{self, Colors, SIDEBAR_WIDTH, SPACE_M, SPACE_S, SPACE_XS, icon};
-use crate::{App, Bg, CUSTOM_BADGE, Field, Message, SheetEdit, Toast, Toggle};
+use crate::fields::{Field, FieldEdit};
+use crate::output::OutputMsg;
+use crate::setups::SetupMsg;
+use crate::update::{ImageMsg, SheetEdit, Toggle};
+use crate::{App, Bg, CUSTOM_BADGE, Message, Toast};
 
 use iced::widget::{Button, Column, Row, button, canvas, column, container, pick_list, row, rule, scrollable, slider, space, stack, text, text_input, toggler, tooltip};
 use iced::{Alignment, Color, Element, Font, Length::Fill, Padding, Theme, font};
@@ -35,7 +39,7 @@ impl App {
             self.presets_card(),
             self.calibration_card(),
             tip(
-                label_button(theme::UNDO, |c| c.muted, "Reset to defaults").style(theme::ghost).padding([6, 10]).on_press(Message::ResetDefaults),
+                label_button(theme::UNDO, |c| c.muted, "Reset to defaults").style(theme::ghost).padding([6, 10]).on_press(Message::Setup(SetupMsg::ResetDefaults)),
                 "Badge, paper and guide settings. Images, saved setups and calibration are kept.",
             ),
             text("Scroll to zoom · drag image to reposition · drag the ring handles to scale or rotate (⇧ snaps)").size(11).style(faint),
@@ -50,7 +54,7 @@ impl App {
         let mut col = Column::new().spacing(SPACE_S).push(section("Images"));
         for (i, img) in self.images.iter().enumerate() {
             let thumb = tip(
-                button(iced::widget::image(self.badges[i].clone()).width(36).height(36)).style(theme::ghost).padding(2).on_press(Message::Replace(i)),
+                button(iced::widget::image(self.badges[i].clone()).width(36).height(36)).style(theme::ghost).padding(2).on_press(Message::Image(ImageMsg::Replace(i))),
                 "Replace image",
             );
             let dpi = self.sheet().effective_dpi(img.width(), img.height(), img.zoom);
@@ -65,8 +69,8 @@ impl App {
             let header = row![
                 thumb,
                 name,
-                tip(icon_button(theme::UNDO, 13.0, 4, Some(Message::ResetPlacement(i))), "Reset position, scale & rotation"),
-                tip(icon_button(theme::TRASH, 13.0, 4, Some(Message::Remove(i))), "Remove"),
+                tip(icon_button(theme::UNDO, 13.0, 4, Some(Message::Image(ImageMsg::ResetPlacement(i)))), "Reset position, scale & rotation"),
+                tip(icon_button(theme::TRASH, 13.0, 4, Some(Message::Image(ImageMsg::Remove(i)))), "Remove"),
             ]
             .spacing(SPACE_XS)
             .align_y(Alignment::Center);
@@ -91,13 +95,13 @@ impl App {
             }
         }
         let add_label = if self.loading > 0 { "Loading…" } else { "Add image" };
-        col = col.push(label_button(theme::PLUS, |c| c.text, add_label).style(theme::secondary).padding([7, 12]).width(Fill).on_press(Message::Open));
+        col = col.push(label_button(theme::PLUS, |c| c.text, add_label).style(theme::secondary).padding([7, 12]).width(Fill).on_press(Message::Image(ImageMsg::Open)));
 
         if self.images.is_empty() && !self.settings.recent.is_empty() {
             let mut recents = Column::new().spacing(2).push(text("Recent").size(11).style(muted));
             for p in self.settings.recent.iter().take(4) {
                 let label = p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-                let link = button(text(truncate_middle(&label, 38)).size(12).wrapping(text::Wrapping::None)).style(theme::link).padding([2, 0]).on_press(Message::OpenRecent(p.clone()));
+                let link = button(text(truncate_middle(&label, 38)).size(12).wrapping(text::Wrapping::None)).style(theme::link).padding([2, 0]).on_press(Message::Image(ImageMsg::OpenRecent(p.clone())));
                 recents = recents.push(tip(link, label));
             }
             col = col.push(recents);
@@ -213,8 +217,8 @@ impl App {
             let names: Vec<String> = self.settings.presets.iter().map(|p| p.name.clone()).collect();
             col = col.push(
                 row![
-                    pick_list(names, self.selected_preset.clone(), Message::LoadPreset).placeholder("Load a setup").width(Fill).padding([6, 10]).text_size(13).style(theme::picker),
-                    tip(icon_button(theme::TRASH, 14.0, 6, self.selected_preset.as_ref().map(|_| Message::DeletePreset)), "Delete selected setup"),
+                    pick_list(names, self.selected_preset.clone(), |name| Message::Setup(SetupMsg::LoadPreset(name))).placeholder("Load a setup").width(Fill).padding([6, 10]).text_size(13).style(theme::picker),
+                    tip(icon_button(theme::TRASH, 14.0, 6, self.selected_preset.as_ref().map(|_| Message::Setup(SetupMsg::DeletePreset))), "Delete selected setup"),
                 ]
                 .spacing(SPACE_XS)
                 .align_y(Alignment::Center),
@@ -224,9 +228,9 @@ impl App {
         card(
             col.push(
                 row![
-                    text_input("Enter a name", &self.preset_name).on_input(Message::PresetName).on_submit(Message::SavePreset).padding([6, 10]).size(13).style(theme::field),
+                    text_input("Enter a name", &self.preset_name).on_input(|s| Message::Setup(SetupMsg::PresetName(s))).on_submit(Message::Setup(SetupMsg::SavePreset)).padding([6, 10]).size(13).style(theme::field),
                     tip(
-                        button(icon(theme::BOOKMARK, 14.0, |c| c.text)).style(theme::secondary).padding(7).on_press_maybe(can_save.then_some(Message::SavePreset)),
+                        button(icon(theme::BOOKMARK, 14.0, |c| c.text)).style(theme::secondary).padding(7).on_press_maybe(can_save.then_some(Message::Setup(SetupMsg::SavePreset))),
                         "Save badge, paper and guide settings"
                     ),
                 ]
@@ -250,21 +254,21 @@ impl App {
         }
         let mut col = column![
             header,
-            label_button(theme::RULER, |c| c.text, "Print test page").style(theme::secondary).padding([7, 12]).width(Fill).on_press(Message::PrintTest),
+            label_button(theme::RULER, |c| c.text, "Print test page").style(theme::secondary).padding([7, 12]).width(Fill).on_press(Message::Output(OutputMsg::PrintTest)),
             labelled(
                 "Test page size to measure",
-                pick_list(Paper::ALL.as_slice(), Some(self.settings.calibration_paper), Message::CalibrationPaper).width(Fill).padding([6, 10]).text_size(13).style(theme::picker)
+                pick_list(Paper::ALL.as_slice(), Some(self.settings.calibration_paper), |p| Message::Setup(SetupMsg::CalibrationPaper(p))).width(Fill).padding([6, 10]).text_size(13).style(theme::picker)
             ),
             row![
                 num_field(format!("Across ({rule} mm)"), self.text(Field::MeasuredX), "mm", Field::MeasuredX),
                 num_field(format!("Down ({rule} mm)"), self.text(Field::MeasuredY), "mm", Field::MeasuredY),
             ]
             .spacing(SPACE_S),
-            button(text("Apply").size(13)).style(theme::secondary).padding([6, 12]).on_press(Message::ApplyCalibration),
+            button(text("Apply").size(13)).style(theme::secondary).padding([6, 12]).on_press(Message::Setup(SetupMsg::ApplyCalibration)),
         ]
         .spacing(SPACE_S);
         if calibrated {
-            col = col.push(button(text("Reset calibration").size(12)).style(theme::link).padding(0).on_press(Message::ResetCalibration));
+            col = col.push(button(text("Reset calibration").size(12)).style(theme::link).padding(0).on_press(Message::Setup(SetupMsg::ResetCalibration)));
         }
         card(col)
     }
@@ -293,9 +297,9 @@ impl App {
         }
         let bar = bar
             .push(tip(icon_button(theme::FIT, 15.0, 6, Some(Message::ZoomFit)), "Fit page (⌘0)"))
-            .push(tip(label_button(theme::EXPORT, |c| c.text, "Export PDF").style(theme::secondary).padding([7, 12]).on_press(Message::Export), "Save a PDF (⌘E)"))
+            .push(tip(label_button(theme::EXPORT, |c| c.text, "Export PDF").style(theme::secondary).padding([7, 12]).on_press(Message::Output(OutputMsg::Export)), "Save a PDF (⌘E)"))
             .push(tip(
-                label_button(theme::PRINT, |c| c.on_accent, "Print").style(theme::primary).padding([7, 14]).on_press(Message::Print),
+                label_button(theme::PRINT, |c| c.on_accent, "Print").style(theme::primary).padding([7, 14]).on_press(Message::Output(OutputMsg::Print)),
                 "Print at 100% through the system dialog (⌘P)",
             ));
 
@@ -336,7 +340,7 @@ fn toast(t: &Toast) -> Element<'_, Message> {
         .push(text(&t.text).size(13).style(move |th: &Theme| tone(th, if t.error { |c| c.danger } else { |c| c.text })));
     if let Some(p) = &t.path {
         let label = if cfg!(target_os = "macos") { "Reveal in Finder" } else { "Show file" };
-        r = r.push(button(text(label).size(13)).style(theme::link).padding(0).on_press(Message::Reveal(p.clone())));
+        r = r.push(button(text(label).size(13)).style(theme::link).padding(0).on_press(Message::Output(OutputMsg::Reveal(p.clone()))));
     }
     r = r.push(icon_button(theme::CLOSE, 12.0, 3, Some(Message::DismissToast)));
     container(r).style(theme::floating).padding([SPACE_S, SPACE_M]).into()
@@ -395,8 +399,8 @@ fn segmented<'a, T: Copy + PartialEq + 'a>(options: &[(T, &'a str)], selected: T
 
 /// Numeric text input with increment/decrement arrows. Up/Down keys step it while focused.
 fn stepper<'a>(value: &'a str, field: Field, width: f32, suffix: Option<&'a str>) -> Element<'a, Message> {
-    let arrow = |body, dir| button(icon(body, 10.0, |c| c.muted)).style(theme::ghost).padding([0, 2]).on_press(Message::Step(field, dir));
-    let input = text_input("", value).id(field.id()).on_input(move |s| Message::Text(field, s)).width(width).padding([5, 8]).size(13).style(theme::field);
+    let arrow = |body, dir| button(icon(body, 10.0, |c| c.muted)).style(theme::ghost).padding([0, 2]).on_press(Message::Field(FieldEdit::Step(field, dir)));
+    let input = text_input("", value).id(field.id()).on_input(move |s| Message::Field(FieldEdit::Text(field, s))).width(width).padding([5, 8]).size(13).style(theme::field);
     let r = row![input, column![arrow(theme::CHEVRON_UP, 1.0), arrow(theme::CHEVRON_DOWN, -1.0)]].spacing(2).align_y(Alignment::Center);
     match suffix {
         Some(suffix) => r.push(text(suffix).size(11).style(muted)).into(),
@@ -411,7 +415,7 @@ fn num_field<'a>(label: impl Into<String>, value: &'a str, suffix: &'a str, fiel
 fn slider_field<'a>(label: &'a str, field: Field, value_mm: f32, range: std::ops::RangeInclusive<f32>, text_value: &'a str, units: Units) -> Element<'a, Message> {
     column![
         row![text(label).size(12).style(muted), space().width(Fill), stepper(text_value, field, 56.0, Some(units.suffix()))].spacing(SPACE_XS).align_y(Alignment::Center),
-        slider(range, value_mm, move |v| Message::Slide(field, v)).step(0.5_f32).style(theme::slider_style),
+        slider(range, value_mm, move |v| Message::Field(FieldEdit::Slide(field, v))).step(0.5_f32).style(theme::slider_style),
     ]
     .spacing(4)
     .into()

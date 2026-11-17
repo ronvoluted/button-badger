@@ -1,26 +1,31 @@
 #![windows_subsystem = "windows"]
 //! Button Badger — print templates for button badges.
 //!
-//! This file is the app's state and wiring. `update` handles messages, `view` draws, and `fields` owns the
-//! numeric text fields; each adds its own `impl App`.
+//! This file is the app's state and wiring. `view` draws and `update` routes messages; each group of messages
+//! is declared beside its handler (`update`, `fields`, `output`, `setups`), which adds its own `impl App`.
 
 mod fields;
 mod images;
 mod layout;
+mod output;
 mod pdf;
 mod preview;
 mod print;
 mod raster;
 mod settings;
+mod setups;
 mod theme;
 mod update;
 mod view;
 
-use fields::Field;
+use fields::{Field, FieldEdit};
 use images::Loaded;
-use layout::{Fit, LineStyle, Orientation, Packing, Paper, Sheet, TestPage, Units, trim_float};
+use layout::{Sheet, TestPage, Units, trim_float};
+use output::OutputMsg;
 use preview::Interaction;
 use settings::Settings;
+use setups::SetupMsg;
+use update::{ImageMsg, SheetEdit};
 
 use iced::widget::canvas::Cache;
 use iced::widget::image::Handle;
@@ -48,13 +53,6 @@ fn main() -> iced::Result {
         .run()
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum Toggle {
-    FaceLine,
-    CropMarks,
-    Clip,
-}
-
 /// Background mode shown in the UI; the sheet itself only stores the resulting colour.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Bg {
@@ -63,69 +61,17 @@ enum Bg {
     Custom,
 }
 
-/// One change to the sheet's settings. `App::edit_sheet` applies it, then refreshes everything derived from the sheet.
-#[derive(Debug, Clone)]
-enum SheetEdit {
-    BadgePreset(String),
-    Paper(Paper),
-    Orientation(Orientation),
-    Packing(Packing),
-    Units(Units),
-    CutStyle(LineStyle),
-    Fit(Fit),
-    Toggle(Toggle, bool),
-    Background(Bg),
-    BgHex(String),
-    BgSwatch([f32; 3]),
-}
-
 #[derive(Debug, Clone)]
 enum Message {
-    // Images
-    Open,
-    FilesPicked(Vec<PathBuf>),
-    Loaded(Result<Loaded, String>),
-    DroppedFile(PathBuf),
-    OpenRecent(PathBuf),
-    Remove(usize),
-    Replace(usize),
-    ReplaceWith(usize, Option<PathBuf>),
-    Replaced(usize, Result<Loaded, String>),
-    ResetPlacement(usize),
-    // Numeric fields
-    Text(Field, String),
-    Slide(Field, f32),
-    Step(Field, f32),
-    /// Up/Down pressed: step whichever field has focus (found via `StepFocused`).
-    ArrowStep(f32),
-    StepFocused(iced::widget::Id, f32),
-    // Sheet settings
+    Image(ImageMsg),
+    Field(FieldEdit),
     Sheet(SheetEdit),
-    // Preview
+    Output(OutputMsg),
+    Setup(SetupMsg),
     Preview(Interaction),
     ZoomBy(f32),
     ZoomFit,
     Page(isize),
-    // Output
-    Export,
-    ExportTo(Option<PathBuf>),
-    Exported(Result<PathBuf, String>),
-    Print,
-    PrintTest,
-    Printed(Result<String, String>),
-    Reveal(PathBuf),
-    // Presets and calibration
-    PresetName(String),
-    SavePreset,
-    LoadPreset(String),
-    DeletePreset,
-    DeletePresetConfirmed(bool),
-    ResetDefaults,
-    ResetDefaultsConfirmed(bool),
-    CalibrationPaper(Paper),
-    ApplyCalibration,
-    ResetCalibration,
-    // Misc
     /// The window lost focus: write any queued settings.
     FocusLost,
     DismissToast,
@@ -149,15 +95,15 @@ struct Toast {
 }
 
 impl Toast {
-    fn info(text: impl Into<String>) -> Option<Toast> {
-        Some(Toast { text: text.into(), path: None, error: false, until: Instant::now() + Duration::from_secs(5) })
+    fn info(text: impl Into<String>) -> Toast {
+        Toast { text: text.into(), path: None, error: false, until: Instant::now() + Duration::from_secs(5) }
     }
 
-    fn error(text: impl Into<String>) -> Option<Toast> {
-        Some(Toast { text: text.into(), path: None, error: true, until: Instant::now() + Duration::from_secs(8) })
+    fn error(text: impl Into<String>) -> Toast {
+        Toast { text: text.into(), path: None, error: true, until: Instant::now() + Duration::from_secs(8) }
     }
 
-    fn result(r: Result<String, String>) -> Option<Toast> {
+    fn result(r: Result<String, String>) -> Toast {
         r.map_or_else(Toast::error, Toast::info)
     }
 }
@@ -228,7 +174,7 @@ impl App {
         app.relayout();
         // Files passed on the command line (e.g. "Open with…") load straight away.
         let args: Vec<PathBuf> = std::env::args_os().skip(1).map(PathBuf::from).filter(|p| p.is_file()).collect();
-        let mut tasks: Vec<_> = args.into_iter().map(|p| app.add_image(p)).collect();
+        let mut tasks: Vec<_> = args.into_iter().map(|p| app.add_image(p).map(Message::Image)).collect();
         if app.settings.dark.is_none() {
             tasks.push(iced::system::theme().map(Message::SystemTheme));
         }
@@ -243,23 +189,23 @@ impl App {
         let events = event::listen_with(|event, status, _| {
             use keyboard::{Key, key::Named};
             match event {
-                Event::Window(window::Event::FileDropped(path)) => Some(Message::DroppedFile(path)),
+                Event::Window(window::Event::FileDropped(path)) => Some(Message::Image(ImageMsg::DroppedFile(path))),
                 Event::Window(window::Event::Unfocused) => Some(Message::FocusLost),
                 Event::Keyboard(keyboard::Event::KeyPressed { key, modifiers, .. }) => {
                     let cmd = modifiers.command();
                     let unfocused = status == event::Status::Ignored;
                     let step = if modifiers.shift() { 10.0 } else { 1.0 };
                     match key.as_ref() {
-                        Key::Character("o") if cmd => Some(Message::Open),
-                        Key::Character("e") if cmd => Some(Message::Export),
-                        Key::Character("p") if cmd => Some(Message::Print),
+                        Key::Character("o") if cmd => Some(Message::Image(ImageMsg::Open)),
+                        Key::Character("e") if cmd => Some(Message::Output(OutputMsg::Export)),
+                        Key::Character("p") if cmd => Some(Message::Output(OutputMsg::Print)),
                         Key::Character("0") if cmd => Some(Message::ZoomFit),
                         Key::Character("=" | "+") if cmd => Some(Message::ZoomBy(1.25)),
                         Key::Character("-") if cmd => Some(Message::ZoomBy(0.8)),
                         Key::Named(Named::ArrowLeft) if unfocused => Some(Message::Page(-1)),
                         Key::Named(Named::ArrowRight) if unfocused => Some(Message::Page(1)),
-                        Key::Named(Named::ArrowUp) => Some(Message::ArrowStep(step)),
-                        Key::Named(Named::ArrowDown) => Some(Message::ArrowStep(-step)),
+                        Key::Named(Named::ArrowUp) => Some(Message::Field(FieldEdit::ArrowStep(step))),
+                        Key::Named(Named::ArrowDown) => Some(Message::Field(FieldEdit::ArrowStep(-step))),
                         Key::Named(Named::Escape) => Some(Message::DismissToast),
                         _ => None,
                     }
@@ -293,7 +239,7 @@ impl App {
     /// Show a failed settings write in the toast, over whatever it was saying.
     fn saved(&mut self, result: Result<(), String>) {
         if let Err(e) = result {
-            self.toast = Toast::error(e);
+            self.toast = Some(Toast::error(e));
         }
     }
 
@@ -371,15 +317,6 @@ impl App {
         self.sheet_changed();
     }
 
-    fn add_image(&mut self, path: PathBuf) -> Task<Message> {
-        self.load(path, Message::Loaded)
-    }
-
-    /// Decode `path` off the UI thread. `loading` counts the decodes in flight; `finish_load` counts them out.
-    fn load(&mut self, path: PathBuf, then: impl FnOnce(Result<Loaded, String>) -> Message + Send + 'static) -> Task<Message> {
-        self.loading += 1;
-        Task::perform(async move { images::load(&path) }, then)
-    }
 }
 
 fn bg_mode_of(bg: Option<[f32; 3]>) -> Bg {

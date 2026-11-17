@@ -3,6 +3,18 @@
 use crate::App;
 use crate::images::wrap_degrees;
 use crate::layout::{Units, trim_float};
+use iced::Task;
+use iced::advanced::widget::{operate, operation::focusable::find_focused};
+
+#[derive(Debug, Clone)]
+pub enum FieldEdit {
+    Text(Field, String),
+    Slide(Field, f32),
+    Step(Field, f32),
+    /// Up/Down pressed: step whichever field has focus (found via `StepFocused`).
+    ArrowStep(f32),
+    StepFocused(iced::widget::Id, f32),
+}
 
 /// Every numeric text field. Each keeps its own text so half-typed values ("3.") survive.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -81,8 +93,31 @@ impl App {
         }
     }
 
+    pub fn edit_field(&mut self, edit: FieldEdit) -> Task<FieldEdit> {
+        match edit {
+            FieldEdit::Text(field, s) => self.apply_text(field, s),
+            FieldEdit::Slide(field, v) => {
+                self.set_dimension(field, v);
+                self.sync_texts();
+                self.sheet_changed();
+            }
+            FieldEdit::Step(field, dir) => self.step_field(field, dir),
+            FieldEdit::ArrowStep(dir) => {
+                // One pass over the widgets; yields nothing unless a widget with an id has focus.
+                return operate(find_focused()).map(move |id| FieldEdit::StepFocused(id, dir));
+            }
+            FieldEdit::StepFocused(id, dir) => {
+                // `texts` has an entry for every field on screen.
+                if let Some(&field) = self.texts.keys().find(|f| f.id() == id) {
+                    self.step_field(field, dir);
+                }
+            }
+        }
+        Task::none()
+    }
+
     /// Apply typed text to the model (copies, scale, rotation or a dimension).
-    pub fn apply_text(&mut self, field: Field, s: String) {
+    fn apply_text(&mut self, field: Field, s: String) {
         match field {
             Field::Copies(i) => {
                 let digits = clean(&s, "", 4);
@@ -136,7 +171,7 @@ impl App {
     }
 
     /// Nudge a numeric field by `dir` steps and re-apply it.
-    pub fn step_field(&mut self, field: Field, dir: f32) {
+    fn step_field(&mut self, field: Field, dir: f32) {
         let current = parse_decimal(self.text(field)).unwrap_or(0.0);
         let step = field.step(self.units());
         let next = (current / step).round() * step + dir * step;
@@ -145,7 +180,7 @@ impl App {
     }
 
     /// Set a sheet dimension, clamped to a sane range. Lengths in mm, weight in points.
-    pub fn set_dimension(&mut self, field: Field, v: f32) {
+    fn set_dimension(&mut self, field: Field, v: f32) {
         let s = &mut self.settings.sheet;
         match field {
             Field::Face => s.face_mm = v.clamp(5.0, 300.0),
