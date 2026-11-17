@@ -161,6 +161,8 @@ enum Message {
     ApplyCalibration,
     ResetCalibration,
     // Misc
+    /// The window lost focus: write any queued settings.
+    FocusLost,
     DismissToast,
     Tick(Instant),
     ToggleDark,
@@ -268,6 +270,7 @@ impl App {
             use keyboard::{Key, key::Named};
             match event {
                 Event::Window(window::Event::FileDropped(path)) => Some(Message::DroppedFile(path)),
+                Event::Window(window::Event::Unfocused) => Some(Message::FocusLost),
                 Event::Keyboard(keyboard::Event::KeyPressed { key, modifiers, .. }) => {
                     let cmd = modifiers.command();
                     let unfocused = status == event::Status::Ignored;
@@ -311,11 +314,12 @@ impl App {
         self.texts.get(&f).map(String::as_str).unwrap_or("")
     }
 
-    /// The sheet changed: re-composite every badge, re-layout and persist.
+    /// The sheet changed: re-composite every badge, re-layout and queue a save. This runs on every keystroke
+    /// and drag tick, so the file is only written once the window loses focus or the app exits.
     fn sheet_changed(&mut self) {
         self.badges = self.images.iter().map(|img| self.compose(img)).collect();
         self.relayout();
-        self.settings.save();
+        self.settings.save_later();
     }
 
     /// One image's placement or pixels changed: re-composite just its badge.
@@ -815,6 +819,7 @@ impl App {
                 self.settings.save();
             }
 
+            Message::FocusLost => settings::flush(),
             Message::DismissToast => self.toast = None,
             Message::Tick(now) => {
                 if self.toast.as_ref().is_some_and(|t| now >= t.until) {

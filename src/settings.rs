@@ -3,6 +3,7 @@
 use crate::layout::{Paper, Sheet};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+use std::sync::{Mutex, Once};
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct Preset {
@@ -39,7 +40,13 @@ impl Default for Settings {
     }
 }
 
+/// Settings queued by `save_later`, waiting for `flush`.
+static PENDING: Mutex<Option<Settings>> = Mutex::new(None);
+
 fn path() -> PathBuf {
+    if cfg!(test) {
+        return std::env::temp_dir().join("button-badger-test/settings.json");
+    }
     let home = std::env::home_dir().unwrap_or_else(|| PathBuf::from("."));
     let dir = if cfg!(target_os = "macos") {
         home.join("Library/Application Support/Button Badger")
@@ -62,6 +69,7 @@ impl Settings {
     }
 
     pub fn save(&self) {
+        PENDING.lock().unwrap().take(); // this write supersedes anything queued
         let p = path();
         if let Some(dir) = p.parent() {
             let _ = std::fs::create_dir_all(dir);
@@ -71,6 +79,17 @@ impl Settings {
         }
     }
 
+    /// Queue a save for the next `flush` (the window losing focus) or for exit, whichever comes first.
+    /// For edits that arrive on every keystroke or drag tick.
+    pub fn save_later(&self) {
+        // Quitting (⌘Q on macOS) ends the process without iced hearing of it, so exit is caught by the C runtime.
+        static AT_EXIT: Once = Once::new();
+        AT_EXIT.call_once(|| unsafe {
+            libc::atexit(flush_at_exit);
+        });
+        *PENDING.lock().unwrap() = Some(self.clone());
+    }
+
     /// Record a successfully opened file in the recent list and save.
     pub fn remember(&mut self, file: &std::path::Path) {
         self.recent.retain(|p| p != file);
@@ -78,5 +97,34 @@ impl Settings {
         self.recent.truncate(8);
         self.last_dir = file.parent().map(|d| d.to_path_buf());
         self.save();
+    }
+}
+
+/// Write the settings queued by `save_later`, if any.
+pub fn flush() {
+    let pending = PENDING.lock().unwrap().take();
+    if let Some(s) = pending {
+        s.save();
+    }
+}
+
+extern "C" fn flush_at_exit() {
+    flush();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn save_later_waits_for_flush() {
+        let _ = std::fs::remove_file(path());
+        Settings { calibration: (1.5, 1.5), ..Settings::default() }.save_later();
+        assert!(!path().exists(), "nothing written until flush");
+        flush();
+        assert_eq!(Settings::load().calibration, (1.5, 1.5));
+        std::fs::remove_file(path()).unwrap();
+        flush();
+        assert!(!path().exists(), "nothing left to write");
     }
 }
